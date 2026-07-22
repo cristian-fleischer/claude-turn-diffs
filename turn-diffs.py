@@ -32,6 +32,7 @@ Reads only ~/.claude/projects/*. Nothing leaves your machine. No dependencies.
 
 import argparse
 import difflib
+import hashlib
 import html
 import json
 import os
@@ -670,6 +671,16 @@ font:15.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Ari
 .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 80px}
 header{position:sticky;top:0;z-index:20;background:var(--bg);
 padding:10px 0 8px;border-bottom:1px solid var(--line)}
+.htop{display:flex;align-items:center;gap:10px}
+.htop h1{font-size:20px;margin:0 4px 0 0;flex:0 1 auto;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.sbtoggle{cursor:pointer;flex:0 0 auto;background:var(--card);border:1px solid var(--line);
+border-radius:6px;color:var(--fg);font-size:15px;line-height:1;padding:5px 9px}
+.sbtoggle:hover{border-color:var(--accent)}
+.hmenu{margin-left:auto;position:relative;flex:0 0 auto}
+.hmenu-sum{display:none}
+.hmenu .hmenu-body{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
+.hmenu-body .vt{margin-left:0}
 header h1{font-size:20px;margin:0 0 4px}
 .sub{color:var(--muted);font-size:13.5px;word-break:break-all}
 .badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;
@@ -779,12 +790,87 @@ color:var(--accent);background:var(--card);border:1px solid var(--line);
 border-radius:6px;padding:4px 10px;margin-left:10px}
 .vt:hover{border-color:var(--accent)}
 .fchip{opacity:.45;margin-left:6px}
-h1 .fchip:first-of-type{margin-left:16px}
+.hmenu-body .fchip:first-of-type{margin-left:14px}
+/* sessions sidebar */
+#sb-backdrop{position:fixed;inset:0;z-index:99;background:rgba(0,0,0,.35);display:none}
+#sb-backdrop.show{display:block}
+#sidebar{position:fixed;top:0;left:0;bottom:0;width:310px;max-width:86vw;z-index:100;
+background:var(--card);border-right:1px solid var(--line);transform:translateX(-102%);
+transition:transform .18s ease;display:flex;flex-direction:column;box-shadow:2px 0 18px rgba(0,0,0,.25)}
+#sidebar.open{transform:none}
+.sb-head{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;
+align-items:center;justify-content:space-between}
+.sb-head b{font-size:14px}
+.sb-close{cursor:pointer;background:none;border:0;color:var(--muted);font-size:20px;line-height:1}
+.sb-list{overflow-y:auto;flex:1;padding:6px}
+.sb-item{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border-radius:7px;
+text-decoration:none;color:var(--fg);border:1px solid transparent;margin:2px 0}
+.sb-item:hover{background:var(--bg);border-color:var(--line)}
+.sb-item.current{border-color:var(--accent);background:var(--bg)}
+.sb-r1{display:flex;align-items:center;gap:8px;min-width:0}
+.sb-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600}
+.sb-mt{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:17px}
+.sb-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--muted)}
+.sb-dot.finished{background:#3fb950}
+.sb-dot.seen{background:var(--muted);opacity:.55}
+.sb-dot.blocked{background:#f85149}
+.sb-dot.working{background:var(--accent);animation:tdpulse 1.1s ease-in-out infinite}
+/* diff comments */
+.fcmt{cursor:pointer;font-size:12px;margin-left:12px;opacity:.6;border:1px solid var(--line);
+background:var(--card);color:var(--fg);border-radius:5px;padding:1px 8px;vertical-align:middle}
+.fcmt:hover{opacity:1;border-color:var(--accent)}
+.td-cbox{margin:6px 0;padding:8px;border:1px solid var(--accent);border-radius:7px;background:var(--card)}
+.td-cbox .ctx{font-size:11.5px;color:var(--muted);margin-bottom:5px;word-break:break-all}
+.td-cbox textarea{width:100%;box-sizing:border-box;min-height:52px;background:var(--bg);color:var(--fg);
+border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit;resize:vertical}
+.td-cbox .row{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+.td-cbox button{cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--fg);
+border-radius:6px;padding:4px 12px;font-size:13px}
+.td-cbox button.pri{background:var(--accent);border-color:var(--accent);color:#0b0f14}
+.td-cmark{margin:4px 0;padding:6px 9px;border-left:3px solid var(--accent);background:var(--card);
+border-radius:0 6px 6px 0;font-size:13px;display:flex;gap:8px;align-items:flex-start}
+.td-cmark .ctext{white-space:pre-wrap;flex:1;min-width:0}
+.td-cmark .x{cursor:pointer;color:var(--muted);flex:0 0 auto}
+.td-cmark .x:hover{color:#f85149}
+.td-cbar{position:fixed;top:64px;right:16px;z-index:80;display:none;gap:10px;align-items:center;
+background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:8px 12px;
+box-shadow:0 6px 20px rgba(0,0,0,.35)}
+.td-cbar.show{display:flex}
+.td-cbar b{font-size:13px}
+.td-cbar button{cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--fg);
+border-radius:6px;padding:5px 12px;font-size:13px}
+.td-cbar button.pri{background:var(--accent);border-color:var(--accent);color:#0b0f14;font-weight:600}
+pre.diff span.ln.add,pre.diff span.ln.del,pre.diff span.ln.ctx{cursor:text}
+pre.diff span.ln.add:hover,pre.diff span.ln.del:hover,pre.diff span.ln.ctx:hover{background:rgba(88,166,255,.08)}
+/* mobile / narrow screens */
+@media(max-width:720px){
+  .wrap{padding:14px 10px 80px}
+  body.view-split .wrap{max-width:100%;padding:14px 6px 80px}
+  .htop h1{font-size:17px}
+  .sub{font-size:11.5px}
+  .hmenu-sum{display:inline-block;cursor:pointer;background:var(--card);border:1px solid var(--line);
+    border-radius:6px;padding:4px 11px;color:var(--fg);font-size:15px;line-height:1}
+  .hmenu .hmenu-body{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:60;
+    flex-direction:column;align-items:stretch;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;padding:8px;min-width:190px;box-shadow:0 8px 24px rgba(0,0,0,.3)}
+  .hmenu.open .hmenu-body{display:flex}
+  .hmenu-body .vt{margin:2px 0;text-align:left}
+  .hmenu-body .fchip:first-of-type{margin:6px 0 2px;border-top:1px solid var(--line);padding-top:8px}
+  .composer .cinner,body.view-split .composer .cinner{max-width:100%;padding:6px 7px}
+  .composer .crow{gap:7px;margin-top:5px}
+  /* collapsed turn cards: keep to one compact line */
+  details.turn>summary{padding:9px 10px;flex-wrap:nowrap;gap:8px;align-items:center}
+  details.turn>summary .pin{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  details.turn>summary .tn{flex:0 0 auto}
+  details.turn>summary .tbtn{flex:0 0 auto;padding:1px 7px}
+  .ts{display:none}
+}
 .fchip.active{opacity:1;border-color:var(--accent)}
 .tbtn{cursor:pointer;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 color:var(--muted);background:none;border:1px solid transparent;border-radius:5px;padding:1px 8px}
 .tbtn:hover{border-color:var(--line);color:var(--fg)}
 details.turn>summary .tbtn.star{margin-left:auto;font-size:14px}
+details.turn>summary .tbtn.hidebtn{font-size:15px;line-height:1;padding:1px 6px}
 details.turn.starred>summary .tbtn.star{color:#e3b341}
 details.turn.starred{border-color:#b08a2e}
 details.turn.hiddenmark{opacity:.55}
@@ -796,9 +882,22 @@ animation:tdpulse 1.1s ease-in-out infinite}
 @keyframes tdpulse{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
 .composer{position:fixed;left:0;right:0;bottom:0;z-index:50;background:var(--card);
 border-top:1px solid var(--line);box-shadow:0 -6px 20px rgba(0,0,0,.18)}
-.composer .cinner{max-width:min(1080px,96vw);margin:0 auto;padding:9px 20px}
+.composer .cinner{max-width:min(1080px,96vw);margin:0 auto;padding:9px 20px;position:relative}
 body.view-split .composer .cinner{max-width:min(1800px,96vw)}
 .composer .crow{display:flex;align-items:center;gap:10px;margin-top:6px}
+/* slash-command autocomplete */
+.td-cac{position:absolute;left:12px;right:12px;bottom:100%;margin-bottom:8px;z-index:70;
+background:var(--card);border:1px solid var(--line);border-radius:9px;overflow-y:auto;
+max-height:min(320px,52vh);box-shadow:0 -8px 26px rgba(0,0,0,.4)}
+.td-cac-row{display:flex;gap:12px;align-items:baseline;padding:8px 12px;cursor:pointer;
+border-bottom:1px solid var(--line)}
+.td-cac-row:last-child{border-bottom:0}
+.td-cac-row.active,.td-cac-row:hover{background:var(--bg)}
+.td-cac-row .nm{font:600 13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+color:var(--accent);flex:0 0 auto;white-space:nowrap}
+.td-cac-row .ds{font-size:11.5px;color:var(--muted);flex:1;min-width:0;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.td-cac-row .sr{font-size:10px;color:var(--muted);opacity:.7;flex:0 0 auto}
 .composer .cstatus{color:var(--muted);font-size:12px;flex:1;word-break:break-word}
 .composer .EasyMDEContainer .CodeMirror{height:auto;min-height:60px;font-size:14px;border-radius:6px}
 .composer .CodeMirror-scroll{min-height:60px;max-height:46vh}
@@ -806,9 +905,6 @@ body.view-split .composer .cinner{max-width:min(1800px,96vw)}
 .composer .ctarget{font-size:11.5px;color:var(--muted);white-space:nowrap;margin-right:auto}
 .composer .ctarget b{color:var(--accent)}
 .composer .cstatus{flex:0 1 auto}
-.cbanner{display:none;align-items:center;gap:8px;color:var(--accent);font-size:12.5px;
-font-weight:600;padding:2px 0 8px}
-.cbanner.show{display:flex}
 /* dark-friendly EasyMDE — theme via our vars, override the vendored light css */
 .composer .CodeMirror{background:var(--bg)!important;color:var(--fg)!important;border-color:var(--line)!important}
 .composer .CodeMirror-cursor{border-left-color:var(--fg)!important}
@@ -869,7 +965,7 @@ var SID = "__SID__";
       d.classList.toggle('starred',st); d.classList.toggle('hiddenmark',hi);
       d.style.display=filter[cat]?'':'none';
       var sb=d.querySelector('.tbtn.star'); if(sb) sb.textContent=st?'★':'☆';
-      var hb=d.querySelector('.tbtn.hidebtn'); if(hb) hb.textContent=hi?'unhide':'hide';
+      var hb=d.querySelector('.tbtn.hidebtn'); if(hb){ hb.textContent=hi?'⊙':'⊘'; hb.title=hi?'Show this turn':'Hide this turn'; }
     });
     q('.fchip').forEach(function(ch){ ch.classList.toggle('active',!!filter[ch.getAttribute('data-cat')]); });
   }
@@ -919,7 +1015,8 @@ var SID = "__SID__";
       ex.addEventListener('click',function(){ var open=!ex.classList.contains('open'); try{ sessionStorage.setItem(key,open?'1':'0'); }catch(e){} setOpen(open); });
     });
   }
-  function setupContent(){ wireDetails(); wireTurns(); wireFilter(); wireExpanders(); highlight(); applyMarks(); }
+  function setupContent(){ wireDetails(); wireTurns(); wireFilter(); wireExpanders(); highlight(); applyMarks();
+    if(window.__td_afterContent) window.__td_afterContent(); }
 
   (function(){
     var btn=document.getElementById('vt');
@@ -940,12 +1037,14 @@ var SID = "__SID__";
     var box=document.getElementById('composer'); var tok=window.__TD_TOKEN__;
     if(!box||!httpLive||!tok||typeof EasyMDE==='undefined') return;
     box.hidden=false;
+    var isTouch=false; try{ isTouch=(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches)||('ontouchstart' in window); }catch(e){}
     var mde=new EasyMDE({element:document.getElementById('td-prompt'), spellChecker:false, status:false,
       autoDownloadFontAwesome:true, minHeight:'70px',
-      placeholder:'Prompt this session…  (Enter to send · Shift+Enter for newline)',
+      placeholder:(isTouch?'Prompt this session…  (Enter = newline · tap Send to submit)'
+                          :'Prompt this session…  (Enter to send · Shift+Enter for newline)'),
       toolbar:['bold','italic','heading','code','quote','unordered-list','ordered-list','link','|','preview']});
     var status=document.getElementById('td-status'), btn=document.getElementById('td-send'),
-        tgt=document.getElementById('td-target'), banner=document.getElementById('td-banner');
+        tgt=document.getElementById('td-target');
     function fit(){ document.body.style.paddingBottom=(box.offsetHeight+20)+'px'; }
     setTimeout(fit,60); window.addEventListener('resize',fit);
     fetch('/target/'+SID).then(function(r){return r.json();}).then(function(j){
@@ -953,11 +1052,63 @@ var SID = "__SID__";
       else{ tgt.textContent='⚠ '+((j&&j.error)||'no pane found'); } fit(); }).catch(function(){});
     function send(){ var text=mde.value(); if(!text.trim()) return; btn.disabled=true; status.textContent='sending…';
       fetch('/prompt/'+SID,{method:'POST',headers:{'Content-Type':'application/json','X-TD-Token':tok},body:JSON.stringify({text:text})})
-        .then(function(r){return r.json();}).then(function(j){ if(j.ok){ status.textContent=''; mde.value(''); if(banner) banner.classList.add('show'); fit(); } else { status.textContent='✗ '+(j.error||'failed'); } })
+        .then(function(r){return r.json();}).then(function(j){ if(j.ok){ status.textContent=''; mde.value(''); fit(); } else { status.textContent='✗ '+(j.error||'failed'); } })
         .catch(function(e){ status.textContent='✗ '+e; }).then(function(){ btn.disabled=false; }); }
     btn.addEventListener('click',send);
-    mde.codemirror.setOption('extraKeys', Object.assign(mde.codemirror.getOption('extraKeys')||{}, {
-      'Enter': function(){ send(); }, 'Shift-Enter': function(cm){ cm.replaceSelection('\\n'); } }));
+    // ---- slash-command autocomplete (list from /commands/<sid>) ----
+    var CM=mde.codemirror.constructor;
+    var cac=document.createElement('div'); cac.className='td-cac'; cac.style.display='none';
+    box.querySelector('.cinner').appendChild(cac);
+    var CMDS=[], cacItems=[], cacIdx=-1;
+    fetch('/commands/'+SID,{cache:'no-store'}).then(function(r){return r.json();})
+      .then(function(j){ CMDS=Array.isArray(j)?j:[]; }).catch(function(){});
+    function cacOpen(){ return cac.style.display!=='none'; }
+    function cacHide(){ cac.style.display='none'; cacItems=[]; cacIdx=-1; }
+    function cacRender(){
+      if(!cacItems.length){ cacHide(); return; }
+      cac.innerHTML='';
+      cacItems.forEach(function(c,i){
+        var row=document.createElement('div'); row.className='td-cac-row'+(i===cacIdx?' active':'');
+        row.innerHTML='<span class="nm"></span><span class="ds"></span><span class="sr"></span>';
+        row.querySelector('.nm').textContent='/'+c.name;
+        row.querySelector('.ds').textContent=c.desc||'';
+        row.querySelector('.sr').textContent=c.source||'';
+        row.addEventListener('mousedown',function(e){ e.preventDefault(); cacAccept(i); });
+        cac.appendChild(row);
+      });
+      cac.style.display='';
+      var a=cac.querySelector('.active'); if(a&&a.scrollIntoView) a.scrollIntoView({block:'nearest'});
+    }
+    function cacUpdate(){
+      var m=/^\\s*\\/([\\w:.-]*)$/.exec(mde.value());   // whole input is one "/token"
+      if(!m){ cacHide(); return; }
+      var q=m[1].toLowerCase();
+      cacItems=CMDS.filter(function(c){ return c.name.toLowerCase().indexOf(q)>=0; }).slice(0,12);
+      cacIdx=cacItems.length?0:-1; cacRender();
+    }
+    function cacMove(d){ if(!cacItems.length) return; cacIdx=(cacIdx+d+cacItems.length)%cacItems.length; cacRender(); }
+    function cacAccept(i){
+      if(i==null) i=cacIdx; if(i<0||i>=cacItems.length){ cacHide(); return; }
+      mde.value('/'+cacItems[i].name+' '); cacHide();
+      var cm=mde.codemirror, d=cm.getDoc(); cm.focus(); d.setCursor({line:0,ch:d.getLine(0).length}); setTimeout(fit,20);
+    }
+    mde.codemirror.on('changes', cacUpdate);
+    mde.codemirror.on('cursorActivity', cacUpdate);
+    mde.codemirror.on('blur', function(){ setTimeout(cacHide,160); });
+
+    // Desktop: Enter sends, Shift+Enter = newline. Touch (Gboard has no easy Shift+Enter):
+    // Enter = newline and you submit with the Send button. Ctrl/Cmd+Enter always sends.
+    // When the command list is open, Enter/Tab accept and Up/Down navigate.
+    var keymap={ 'Shift-Enter': function(cm){ cm.replaceSelection('\\n'); },
+                 'Ctrl-Enter': function(){ send(); }, 'Cmd-Enter': function(){ send(); },
+                 'Up': function(){ if(cacOpen()){ cacMove(-1); return; } return CM.Pass; },
+                 'Down': function(){ if(cacOpen()){ cacMove(1); return; } return CM.Pass; },
+                 'Tab': function(){ if(cacOpen()){ cacAccept(); return; } return CM.Pass; },
+                 'Esc': function(){ if(cacOpen()){ cacHide(); return; } return CM.Pass; } };
+    keymap['Enter'] = isTouch
+      ? function(cm){ if(cacOpen()){ cacAccept(); return; } cm.execCommand('newlineAndIndent'); }
+      : function(){ if(cacOpen()){ cacAccept(); return; } send(); };
+    mde.codemirror.setOption('extraKeys', Object.assign(mde.codemirror.getOption('extraKeys')||{}, keymap));
     // Formatting toggle (persisted) — show/hide the toolbar on demand
     var fmtBtn=document.getElementById('td-fmt');
     function setFmt(on){ box.classList.toggle('show-fmt',on); if(fmtBtn) fmtBtn.classList.toggle('active',on); setTimeout(fit,150); }
@@ -979,6 +1130,9 @@ var SID = "__SID__";
     if(morphing) return; morphing=true;
     fetch(location.href,{cache:'no-store'}).then(function(r){return r.text();}).then(function(t){
       var doc=new DOMParser().parseFromString(t,'text/html');
+      // if the page template (CSS/JS/markup) changed, a morph can't apply it — full reload once
+      var cb=document.querySelector('meta[name="td-build"]'), nb=doc.querySelector('meta[name="td-build"]');
+      if(cb&&nb&&cb.getAttribute('content')!==nb.getAttribute('content')){ location.reload(); return; }
       var neww=doc.querySelector('.wrap'), cur=document.querySelector('.wrap');
       if(neww&&cur){
         morphdom(cur,neww,{ onBeforeElUpdated:function(from,to){
@@ -1015,6 +1169,181 @@ var SID = "__SID__";
       function tick(){ if(isOn() && !document.hidden){ location.reload(); } else { setTimeout(tick,1000); } }
       setTimeout(tick, REFRESH*1000);
     }
+  })();
+
+  // ---- header options menu (mobile popover) ----
+  (function(){
+    var hm=document.querySelector('.hmenu'), sum=document.getElementById('hmenu-sum');
+    if(!hm||!sum) return;
+    sum.addEventListener('click',function(e){ e.stopPropagation(); hm.classList.toggle('open'); });
+    document.addEventListener('click',function(e){ if(hm.classList.contains('open') && !hm.contains(e.target)) hm.classList.remove('open'); });
+  })();
+
+  // ---- sessions sidebar ----
+  (function(){
+    var sb=document.getElementById('sidebar'), bd=document.getElementById('sb-backdrop'),
+        tgl=document.getElementById('sbtoggle'), cls=document.getElementById('sb-close'),
+        list=document.getElementById('sb-list');
+    if(!sb||!tgl) return;
+    function seenKey(sid){ return 'td:seen:'+sid; }
+    function markSeen(sid,mtime){ try{ LS.setItem(seenKey(sid),String(mtime)); }catch(e){} }
+    function open(){ sb.classList.add('open'); if(bd) bd.classList.add('show'); load(); }
+    function close(){ sb.classList.remove('open'); if(bd) bd.classList.remove('show'); }
+    tgl.addEventListener('click',open);
+    if(cls) cls.addEventListener('click',close);
+    if(bd) bd.addEventListener('click',close);
+    document.addEventListener('keydown',function(e){ if(e.key==='Escape') close(); });
+    function load(){
+      if(!httpLive){ list.innerHTML='<div style="padding:14px;color:var(--muted);font-size:13px">'
+        +'The session list needs the live server (open the http:// link).</div>'; return; }
+      fetch('/sessions',{cache:'no-store'}).then(function(r){return r.json();}).then(function(rows){
+        list.innerHTML='';
+        rows.forEach(function(s){
+          var seenAt=0; try{ seenAt=parseFloat(LS.getItem(seenKey(s.sid))||'0'); }catch(e){}
+          var st=s.status;
+          if(st==='finished' && seenAt && seenAt>=s.mtime) st='seen';
+          if(s.sid===SID) st=(s.status==='working'||s.status==='blocked')?s.status:'seen';
+          var a=document.createElement('a');
+          a.className='sb-item'+(s.sid===SID?' current':'');
+          a.href='/'+s.file;
+          a.innerHTML='<span class="sb-r1"><span class="sb-dot '+st+'"></span><span class="sb-nm"></span></span>'
+            +'<span class="sb-mt"></span>';
+          a.querySelector('.sb-nm').textContent=s.name||s.sid;
+          var base=s.cwd?s.cwd.replace(/\\/+$/,'').replace(/^.*\\//,''):'';
+          a.querySelector('.sb-mt').textContent=[base,(s.turns?(s.turns+' turn(s)'):'')].filter(Boolean).join(' · ');
+          a.addEventListener('click',function(){ markSeen(s.sid,s.mtime); });
+          list.appendChild(a);
+        });
+      }).catch(function(){ list.innerHTML='<div style="padding:14px;color:var(--muted)">failed to load</div>'; });
+    }
+    // keep THIS session marked seen (using its server-reported mtime) so it never nags itself
+    if(httpLive){ fetch('/sessions',{cache:'no-store'}).then(function(r){return r.json();})
+      .then(function(rows){ rows.forEach(function(s){ if(s.sid===SID) markSeen(s.sid,s.mtime); }); }).catch(function(){}); }
+  })();
+
+  // ---- diff comments -> compile a prompt and send to the agent ----
+  (function(){
+    var CKEY='td:'+SID+':comments', tok=window.__TD_TOKEN__;
+    var comments=[]; try{ comments=JSON.parse(LS.getItem(CKEY))||[]; }catch(e){}
+    function save(){ try{ LS.setItem(CKEY,JSON.stringify(comments)); }catch(e){} }
+
+    var bar=document.createElement('div'); bar.className='td-cbar';
+    bar.innerHTML='<b class="n"></b><button class="pri send" type="button">Send to agent</button>'
+      +'<button class="clr" type="button">Clear</button>';
+    document.body.appendChild(bar);
+    var barN=bar.querySelector('.n'), sendB=bar.querySelector('.send'), clrB=bar.querySelector('.clr');
+    function updateBar(){ bar.classList.toggle('show',comments.length>0);
+      barN.textContent=comments.length+' comment'+(comments.length!==1?'s':''); }
+    clrB.addEventListener('click',function(){ comments=[]; save(); renderMarks(); updateBar(); });
+
+    function fileOf(el){ var f=el.closest?el.closest('.file'):null; if(!f) return '';
+      var h=f.querySelector('summary h3'); return h?h.textContent:''; }
+    function lineInfo(el){
+      if(el.classList.contains('ln')){ return {line:'',snip:(el.textContent||'').replace(/^[+\\- ]/,'')}; }
+      var tr=el.closest('tr'), lno='';
+      if(tr){ var a=tr.querySelector('.lno'), b=tr.querySelector('.rno');
+        lno=(b&&b.textContent)||(a&&a.textContent)||''; }
+      return {line:lno?('L'+lno):'', snip:el.textContent||''};
+    }
+    function shortSnip(s){ s=(s||'').trim(); return s.length>90?s.slice(0,90)+'…':s; }
+
+    function openEditor(anchor, ctx){
+      var host=anchor;
+      if(anchor.tagName==='SPAN') host=anchor.closest('pre')||anchor;
+      else if(anchor.tagName==='TD') host=anchor.closest('table')||anchor;
+      var nx=host.nextSibling;
+      if(nx && nx.classList && nx.classList.contains('td-cbox')){ nx.querySelector('textarea').focus(); return; }
+      var box=document.createElement('div'); box.className='td-cbox';
+      box.innerHTML='<div class="ctx"></div><textarea placeholder="Comment on this code… (Ctrl+Enter to add)"></textarea>'
+        +'<div class="row"><button class="cancel" type="button">Cancel</button>'
+        +'<button class="pri add" type="button">Add comment</button></div>';
+      box.querySelector('.ctx').textContent=ctx.file+(ctx.line?(' · '+ctx.line):'')+(ctx.snip?(' · '+shortSnip(ctx.snip)):'');
+      host.parentNode.insertBefore(box, host.nextSibling);
+      var ta=box.querySelector('textarea'); ta.focus();
+      box.querySelector('.cancel').addEventListener('click',function(){ box.remove(); });
+      box.querySelector('.add').addEventListener('click',function(){
+        var v=ta.value.trim(); if(!v){ ta.focus(); return; }
+        comments.push({file:ctx.file,line:ctx.line,snip:shortSnip(ctx.snip),text:v});
+        save(); box.remove(); renderMarks(); updateBar(); });
+      ta.addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ box.querySelector('.add').click(); } });
+    }
+
+    function renderMarks(){
+      q('.td-cmark').forEach(function(m){ m.remove(); });
+      comments.forEach(function(c,idx){
+        var target=null;
+        q('.file').forEach(function(f){ if(target) return;
+          var h=f.querySelector('summary h3'); if(!h||h.textContent!==c.file) return;
+          if(c.snip){ f.querySelectorAll('pre.diff span.ln, table.split td.cell').forEach(function(el){
+            if(target) return; if((el.textContent||'').indexOf(c.snip)>=0) target=el; }); }
+          if(!target) target=f.querySelector('summary');
+        });
+        var host=null;
+        if(target){ host=target.tagName==='SPAN'?target.closest('pre'):
+                         target.tagName==='TD'?target.closest('table'):target; }
+        if(!host||!host.parentNode) return;
+        var mk=document.createElement('div'); mk.className='td-cmark';
+        mk.innerHTML='<span class="ctext"></span><span class="x" title="remove">✕</span>';
+        mk.querySelector('.ctext').textContent=(c.line?(c.line+'  '):'')+c.text;
+        mk.querySelector('.x').addEventListener('click',(function(ix){ return function(){
+          comments.splice(ix,1); save(); renderMarks(); updateBar(); }; })(idx));
+        host.parentNode.insertBefore(mk, host.nextSibling);
+      });
+    }
+
+    document.addEventListener('click',function(e){
+      if(!e.target.closest) return;
+      var ln=e.target.closest('pre.diff span.ln.add, pre.diff span.ln.del, pre.diff span.ln.ctx, table.split td.cell');
+      if(!ln || ln.classList.contains('blank')) return;
+      var sel=window.getSelection&&window.getSelection(); if(sel&&!sel.isCollapsed) return;
+      var file=fileOf(ln); if(!file) return;
+      var info=lineInfo(ln);
+      openEditor(ln, {file:file, line:info.line, snip:info.snip});
+    });
+
+    function addFileButtons(){
+      q('.file > summary').forEach(function(s){
+        if(s.dataset.fcb) return; s.dataset.fcb='1';
+        var b=document.createElement('button'); b.className='fcmt'; b.type='button'; b.textContent='💬 comment';
+        b.addEventListener('click',function(ev){ ev.preventDefault(); ev.stopPropagation();
+          var f=s.closest('.file'); if(f&&!f.open) f.open=true;
+          var h=s.querySelector('h3'); openEditor(s, {file:h?h.textContent:'', line:'', snip:''}); });
+        s.appendChild(b);
+      });
+    }
+
+    function compile(){
+      var order=[], byFile={};
+      comments.forEach(function(c){ if(!byFile[c.file]){ byFile[c.file]=[]; order.push(c.file); } byFile[c.file].push(c); });
+      var out=['I reviewed the changes in turn-diffs and have the following comments:',''];
+      order.forEach(function(f){
+        out.push('### '+f);
+        byFile[f].forEach(function(c){ out.push('- '+(c.line?(c.line+' '):'')+c.text+(c.snip?('   (`'+c.snip+'`)'):'')); });
+        out.push('');
+      });
+      out.push('Please address these comments.');
+      return out.join('\\n');
+    }
+
+    sendB.addEventListener('click',function(){
+      if(!comments.length) return;
+      var text=compile();
+      if(httpLive && tok){
+        sendB.disabled=true; barN.textContent='sending…';
+        fetch('/prompt/'+SID,{method:'POST',headers:{'Content-Type':'application/json','X-TD-Token':tok},
+          body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){
+            if(j.ok){ comments=[]; save(); renderMarks(); updateBar(); }
+            else barN.textContent='✗ '+(j.error||'failed');
+          }).catch(function(e){ barN.textContent='✗ '+e; }).then(function(){ sendB.disabled=false; });
+      } else {
+        try{ navigator.clipboard.writeText(text).then(function(){ barN.textContent='copied to clipboard'; },
+          function(){ barN.textContent='copy failed'; }); }
+        catch(e){ barN.textContent='no live server'; }
+      }
+    });
+
+    window.__td_afterContent=function(){ addFileButtons(); renderMarks(); };
+    addFileButtons(); renderMarks(); updateBar();
   })();
 })();
 """
@@ -1296,6 +1625,10 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
     P.append(f"<meta name='td-name' content='{esc(title or Path(str(session_path)).stem)}'>")
     P.append(f"<meta name='td-cwd' content='{esc(cwd)}'>")
     P.append(f"<meta name='td-turns' content='{len(turns)}'>")
+    # signature of the page template (CSS+JS): if it changes, open pages full-reload
+    # instead of morphing, so code changes actually show up without a manual refresh
+    build = hashlib.md5((CSS + JS).encode("utf-8")).hexdigest()[:10]
+    P.append(f"<meta name='td-build' content='{build}'>")
     hljs_js = _asset("highlight.min.js")
     hl_on = bool(hljs_js)
     P.append(f"<style>{CSS}</style>")
@@ -1311,20 +1644,27 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
              "document.body.classList.add('view-split');}catch(e){}</script>")
     # composer editor styles — load only over http (served by --serve); harmless 404 on file://
     P.append("<link rel='stylesheet' href='/assets/easymde.min.css'>")
-    P.append(f"</head><body class='{'hl' if hl_on else ''}'>{early}<div class='wrap'>")
+    sidebar = ("<div id='sb-backdrop'></div>"
+               "<aside id='sidebar'><div class='sb-head'><b>Sessions</b>"
+               "<button class='sb-close' id='sb-close' type='button' aria-label='Close'>×</button></div>"
+               "<div class='sb-list' id='sb-list'></div></aside>")
+    P.append(f"</head><body class='{'hl' if hl_on else ''}'>{early}{sidebar}<div class='wrap'>")
     ar_btn = ("<button class='vt' id='ar' type='button'>⟳ Auto-reload</button>"
               if refresh > 0 else "")
     heading = esc(title) if title else "Turn-by-turn changes"
     chips = ("<button class='vt fchip' data-cat='regular' type='button'>Regular</button>"
              "<button class='vt fchip' data-cat='starred' type='button'>★ Starred</button>"
              "<button class='vt fchip' data-cat='hidden' type='button'>Hidden</button>")
-    P.append(f"<header><h1>{heading} "
-             "<button class='vt' id='vt' type='button'>◧ Side-by-side</button>"
-             f"{ar_btn}{chips}</h1>")
-    kicker = "Turn-by-turn changes · " if title else ""
+    controls = ("<button class='vt' id='vt' type='button'>◧ Side-by-side</button>"
+                f"{ar_btn}{chips}")
+    P.append("<header><div class='htop'>"
+             "<button class='sbtoggle' id='sbtoggle' type='button' title='Sessions' aria-label='Sessions'>☰</button>"
+             f"<h1>{heading}</h1>"
+             "<div class='hmenu'><button class='hmenu-sum' id='hmenu-sum' type='button' title='Options'>⋯</button>"
+             f"<div class='hmenu-body'>{controls}</div></div>"
+             "</div>")
     cwd_line = f"cwd: <code>{esc(cwd)}</code> · " if cwd else ""
-    P.append(f"<div class='sub'>{kicker}{cwd_line}{len(turns)} turn(s) · generated {gen} {live}"
-             f"<br>Session: <code>{esc(str(session_path))}</code></div></header>")
+    P.append(f"<div class='sub'>{cwd_line}{len(turns)} turn(s) · generated {gen} {live}</div></header>")
 
     # turns
     for i, t in enumerate(turns, 1):
@@ -1338,11 +1678,11 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
               sum(len(t["files"][p].get("ops", [])) for p in t["order"]),
               1 if (in_progress and i == len(turns)) else 0)
         P.append(f"<details class='turn' id='turn-{i}'{op} data-sig='{sig}'><summary>"
-                 f"<span class='tn'>Turn {i}</span>"
+                 f"<span class='tn'>#{i}</span>"
                  + (f"<span class='ts'>{esc(ts)}</span>" if ts else "")
                  + f"<span class='pin'>{esc(snippet(t['prompt'], 110))}</span>{work}"
                  "<button class='tbtn star' type='button' title='Star this turn'>☆</button>"
-                 "<button class='tbtn hidebtn' type='button' title='Hide this turn'>hide</button>"
+                 "<button class='tbtn hidebtn' type='button' title='Hide this turn' aria-label='Hide'>⊘</button>"
                  "</summary>")
         P.append("<div class='body'>")
         P.append(f"<blockquote class='prompt'>{esc(t['prompt'] or '(empty)')}</blockquote>")
@@ -1410,8 +1750,6 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
     P.append("</div>")
     # composer (prompt this session's terminal) — only activates when served live
     P.append("<div id='composer' class='composer' hidden><div class='cinner'>"
-             "<div id='td-banner' class='cbanner'><span class='dot'></span>"
-             "Prompt sent — agent working…</div>"
              "<textarea id='td-prompt'></textarea>"
              "<div class='crow'><span id='td-target' class='ctarget'></span>"
              "<span id='td-status' class='cstatus'></span>"
@@ -1655,6 +1993,243 @@ margin-top:3px;word-break:break-all}}
     return body.encode()
 
 
+def _herdr_statuses():
+    """Map claude session_id -> herdr agent_status ('working'/'idle'/…) if herdr runs."""
+    import subprocess
+    try:
+        r = subprocess.run(["herdr", "pane", "list"], capture_output=True, text=True, timeout=4)
+        if r.returncode != 0:
+            return {}
+        out = {}
+        for p in json.loads(r.stdout).get("result", {}).get("panes", []):
+            s = (p.get("agent_session") or {}).get("value")
+            if s:
+                out[s] = p.get("agent_status", "")
+        return out
+    except Exception:
+        return {}
+
+
+def _tail_status(tx, max_bytes=20000):
+    """Peek at the end of a transcript: 'blocked' if it ends on an unanswered
+    AskUserQuestion/ExitPlanMode or a trailing question, else None."""
+    try:
+        size = tx.stat().st_size
+        with open(tx, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()
+            data = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    answered, pending_ask, last_text = set(), None, ""
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        for tid, _t in tool_results(e):
+            answered.add(tid)
+        if e.get("type") == "assistant":
+            c = e.get("message", {}).get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and b.get("name") in ("AskUserQuestion", "ExitPlanMode"):
+                        pending_ask = b.get("id")
+                    elif b.get("type") == "text" and (b.get("text") or "").strip():
+                        last_text = b["text"]
+    if pending_ask and pending_ask not in answered:
+        return "blocked"
+    if last_text.strip().endswith("?"):
+        return "blocked"
+    return None
+
+
+def _session_status(sid, tx, herdr_map):
+    hs = herdr_map.get(sid)
+    if hs == "working":
+        return "working"
+    if hs is None and tx is not None:   # no herdr info -> recency heuristic
+        try:
+            if time.time() - tx.stat().st_mtime < 8:
+                return "working"
+        except OSError:
+            pass
+    if tx is not None and _tail_status(tx) == "blocked":
+        return "blocked"
+    return "finished"
+
+
+def _sessions_json(rd):
+    herdr_map = _herdr_statuses()
+    out = []
+    for f in rd.glob("*.html"):
+        sid = f.stem
+        try:
+            head = f.read_text(encoding="utf-8", errors="replace")[:8000]
+        except OSError:
+            head = ""
+
+        def meta(n):
+            m = re.search(r"<meta name='td-%s' content='([^']*)'>" % n, head)
+            return html.unescape(m.group(1)) if m else ""
+
+        tx = _transcript_for(sid)
+        out.append({"sid": sid, "file": f.name, "name": meta("name") or sid,
+                    "cwd": meta("cwd"), "turns": meta("turns"),
+                    "status": _session_status(sid, tx, herdr_map),
+                    "mtime": f.stat().st_mtime})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------- slash commands
+_BUILTIN_CMDS = [
+    ("help", "List available commands"),
+    ("clear", "Clear conversation history and free the context"),
+    ("compact", "Summarize and compact the conversation"),
+    ("context", "Show what's using the context window"),
+    ("review", "Review a pull request / code changes"),
+    ("cost", "Show token usage and cost for this session"),
+    ("model", "Switch the active model"),
+    ("config", "Open the settings panel"),
+    ("resume", "Resume a previous session"),
+    ("init", "Bootstrap a CLAUDE.md for the project"),
+    ("memory", "Edit Claude memory files"),
+    ("agents", "Manage subagents"),
+    ("mcp", "Manage MCP servers"),
+    ("status", "Show session / account status"),
+    ("pr-comments", "Fetch and show PR comments"),
+    ("vim", "Toggle vim editing mode"),
+    ("terminal-setup", "Configure terminal key bindings"),
+    ("doctor", "Diagnose installation health"),
+]
+
+
+def _parse_frontmatter(path):
+    """(name, description) from a markdown file's leading YAML-ish frontmatter."""
+    try:
+        txt = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, ""
+    if not txt.startswith("---"):
+        return None, ""
+    end = txt.find("\n---", 3)
+    fm = txt[3:end] if end != -1 else ""
+    name, desc = None, ""
+    for line in fm.splitlines():
+        m = re.match(r"\s*([A-Za-z][\w-]*)\s*:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        k, v = m.group(1).lower(), m.group(2).strip().strip('"').strip("'")
+        if k == "description" and not desc:
+            desc = v
+        elif k == "name" and name is None:
+            name = v
+    return name, desc
+
+
+def _short(d, n=150):
+    d = (d or "").strip()
+    return d[:n].rstrip() + "…" if len(d) > n else d
+
+
+def _scan_commands(base, source, out, seen):
+    if not base.is_dir():
+        return
+    for f in sorted(base.rglob("*.md")):
+        name = ":".join(f.relative_to(base).with_suffix("").parts)
+        if not name or name in seen:
+            continue
+        _n, desc = _parse_frontmatter(f)
+        seen.add(name)
+        out.append({"name": name, "desc": _short(desc), "source": source})
+
+
+def _scan_skills(base, source, out, seen):
+    if not base.is_dir():
+        return
+    for sk in sorted(base.glob("*/SKILL.md")):
+        name_ov, desc = _parse_frontmatter(sk)
+        name = name_ov or sk.parent.name
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "desc": _short(desc), "source": source})
+
+
+def _scan_plugins(cwd, out, seen):
+    reg = CLAUDE_DIR / "plugins" / "installed_plugins.json"
+    try:
+        data = json.loads(reg.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    for key, entries in (data.get("plugins") or {}).items():
+        plug = key.split("@", 1)[0]
+        for e in entries if isinstance(entries, list) else []:
+            if e.get("scope") == "project" and cwd and e.get("projectPath") not in (cwd, str(cwd)):
+                continue
+            ip = e.get("installPath")
+            if not ip:
+                continue
+            cdir = Path(ip) / "commands"
+            if not cdir.is_dir():
+                continue
+            for f in sorted(cdir.rglob("*.md")):
+                cn = ":".join(f.relative_to(cdir).with_suffix("").parts)
+                name = f"{plug}:{cn}"
+                if name in seen:
+                    continue
+                _n, desc = _parse_frontmatter(f)
+                seen.add(name)
+                out.append({"name": name, "desc": _short(desc), "source": "plugin:" + plug})
+
+
+def _slash_commands(cwd):
+    """Discover slash commands available to a session: project + user commands and
+    skills, enabled plugin commands, plus a curated set of built-ins."""
+    out, seen = [], set()
+    cwdp = Path(cwd) if cwd else None
+    # only treat cwd/.claude as a distinct "project" source if it isn't the user config dir
+    proj_distinct = False
+    if cwdp:
+        try:
+            proj_distinct = (cwdp / ".claude").resolve() != CLAUDE_DIR.resolve()
+        except OSError:
+            proj_distinct = True
+    if proj_distinct:
+        _scan_commands(cwdp / ".claude" / "commands", "project", out, seen)
+        _scan_skills(cwdp / ".claude" / "skills", "skill·project", out, seen)
+    _scan_commands(CLAUDE_DIR / "commands", "user", out, seen)
+    _scan_skills(CLAUDE_DIR / "skills", "skill", out, seen)
+    try:
+        _scan_plugins(cwd, out, seen)
+    except Exception:
+        pass
+    for nm, desc in _BUILTIN_CMDS:
+        if nm in seen:
+            continue
+        seen.add(nm)
+        out.append({"name": nm, "desc": desc, "source": "built-in"})
+    prio = {"built-in": 3}
+    out.sort(key=lambda c: (prio.get(c["source"], 0), c["name"]))
+    return out
+
+
+def _report_cwd(sid):
+    try:
+        head = report_path_for(sid).read_text(encoding="utf-8", errors="replace")[:8000]
+    except OSError:
+        return ""
+    m = re.search(r"<meta name='td-cwd' content='([^']*)'>", head)
+    return html.unescape(m.group(1)) if m else ""
+
+
 _REGEN_LOCK = threading.Lock()
 _REGEN_AT = {}
 
@@ -1707,6 +2282,15 @@ def serve(port):
             p = self.path.split("?")[0]
             if p == "/":
                 return self._send(200, "text/html; charset=utf-8", _index_html(rd))
+            if p == "/sessions":
+                body = json.dumps(_sessions_json(rd)).encode()
+                return self._send(200, "application/json; charset=utf-8", body)
+            if p.startswith("/commands/"):
+                sid = p[len("/commands/"):]
+                if sid.endswith(".html"):
+                    sid = sid[:-5]
+                body = json.dumps(_slash_commands(_report_cwd(sid))).encode()
+                return self._send(200, "application/json; charset=utf-8", body)
             if p.startswith("/assets/"):
                 a = (assets / p[len("/assets/"):]).resolve()
                 if a.parent == assets and a.is_file():
