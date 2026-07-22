@@ -11,26 +11,39 @@ agent UI beside your terminal.
 
 It's per-session and **off by default** — you opt in with `/turn-diffs` and get a link.
 
+![turn-diffs in action](docs/demo.gif)
+
 ---
 
 ## Features
 
-- **Per-turn layout** — each turn shows: your prompt → a collapsed **Process** timeline
-  (tool calls + thinking markers + intermediate narration) → **file diffs** → subagent panels →
-  the **Answer** (final summary only).
+- **Per-turn layout** — each turn (`#1`, `#2`, …) shows: your prompt → a collapsed **Process**
+  timeline (tool calls + thinking markers + intermediate narration) → **file diffs** → subagent
+  panels → the **Answer** (final summary only).
 - **Unified & side-by-side diffs** with syntax highlighting, collapsed unchanged context, and
   per-file collapse to mark files reviewed.
 - **Live streaming** — with the local server running, updates are pushed over SSE and the page
   morphs only the changed nodes (no full reload, no flicker), including mid-turn as Claude works.
+  The page even auto-reloads itself when you upgrade the tool.
+- **Sessions sidebar** — a collapsible list of every session with a live status dot:
+  **working** (pulsing), **finished** (green), **seen** (gray), **blocked** (red, awaiting an
+  answer). Jump between sessions without leaving the browser.
 - **Prompt composer** — a markdown editor (bold/headings/code/preview) that sends your prompt to
-  the session's terminal pane. `Enter` to send, `Shift+Enter` for a newline.
+  the session's terminal pane, with **slash-command autocomplete** (your project/user commands,
+  skills, plugin commands, and built-ins). `Enter` to send on desktop; on touch devices `Enter`
+  makes a newline and you tap **Send** (`Ctrl`/`Cmd+Enter` always sends).
+- **Review comments → prompt** — click any diff line (or a whole file) to leave a comment, then
+  **Send to agent**: the comments compile into a prompt with exact code locations and are typed
+  into your session. On `file://` it copies the compiled prompt instead.
 - **Subagent diffs** — file changes made by spawned subagents are folded into the turn that
   spawned them.
 - **Star / hide turns** and a **Regular / Starred / Hidden** filter, an accordion (Ctrl+Click to
-  open several), a session index, session name + cwd in the header — all state persisted per session.
+  open several), a session index, session name in the header — all state persisted per session.
+- **Mobile-friendly** — edge-to-edge layout on narrow screens, single-line turn cards, and a
+  header that collapses its controls into a popover. Works great over Tailscale from your phone.
 - **Self-contained & offline** — reports inline everything (highlight.js + themes); no network,
-  nothing leaves your machine. Works from `file://` with no server; the server just adds live push
-  and the composer.
+  nothing leaves your machine. Works from `file://` with no server; the server just adds live push,
+  the sidebar, and the composer.
 - **Stdlib only** — one Python file, no `pip` dependencies.
 
 ---
@@ -98,12 +111,19 @@ Reports live in `~/.claude/turn-diffs/reports/<session-id>.html` (override the b
 - serves the reports and an index at `http://127.0.0.1:8787/`,
 - pushes **Server-Sent Events** on change so the page updates live (the page falls back to static
   behavior on `file://`),
+- serves the **sessions sidebar** (`/sessions`, with live status) and **slash-command list**
+  (`/commands`),
 - exposes a token-guarded `POST /prompt/<session>` that types a prompt into the session's terminal
   pane.
 
-When you open a report **over http**, a composer appears at the bottom. Type markdown, hit `Enter`,
-and it's typed into your session's terminal pane (multiline is sent as one bracketed paste). The
-resulting turn streams into the view above.
+When you open a report **over http**, a composer appears at the bottom. Type markdown, hit `Enter`
+(desktop), and it's typed into your session's terminal pane (multiline is sent as one bracketed
+paste); the resulting turn streams into the view above. Type `/` to autocomplete a slash command
+(↑/↓ to pick, `Enter`/`Tab` to accept). On touch devices `Enter` inserts a newline instead — tap
+**Send**, or use `Ctrl`/`Cmd+Enter`.
+
+> **Note:** the composer types into your terminal, so keep the server on the loopback interface or
+> a private tailnet — never expose it with `tailscale funnel` or a public tunnel.
 
 ### Multiplexer support
 
