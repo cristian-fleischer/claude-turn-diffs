@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
+          }
+        ]
+      }
+    ]
+  }
+}

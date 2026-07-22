@@ -1,0 +1,14 @@
+{
+  "name": "turn-diffs",
+  "description": "Live, per-session turn-by-turn diff viewer for Claude Code. Streams each turn's prompt, tool process, file diffs, and final answer into a self-contained browser view — with a markdown composer that prompts your session's terminal pane.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Cristian Fleischer"
+  },
+  "homepage": "https://github.com/cristian-fleischer/claude-turn-diffs",
+  "repository": "https://github.com/cristian-fleischer/claude-turn-diffs",
+  "license": "MIT",
+  "keywords": ["diff", "viewer", "live", "sessions", "transcript", "review"],
+  "commands": "./commands",
+  "hooks": "./hooks/hooks.json"
+}

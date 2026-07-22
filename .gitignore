@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# turn-diffs runtime state (never commit — contains your session data / secrets)
+reports/
+enabled/
+serve-token
+panes.json
+serve.log
+*.tmp
