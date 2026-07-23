@@ -6,7 +6,7 @@
           {
             "type": "command",
             "async": true,
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
+            "command": "TURN_DIFFS_DIR=\"${CLAUDE_PLUGIN_DATA:-$HOME/.claude/turn-diffs}\" python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
           }
         ]
       }
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "async": true,
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
+            "command": "TURN_DIFFS_DIR=\"${CLAUDE_PLUGIN_DATA:-$HOME/.claude/turn-diffs}\" python3 \"${CLAUDE_PLUGIN_ROOT}/turn-diffs.py\" --hook"
           }
         ]
       }

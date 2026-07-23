@@ -33,28 +33,40 @@ Reads only ~/.claude/projects/*. Nothing leaves your machine. No dependencies.
 import argparse
 import difflib
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import signal
 import sys
+import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 PROJECTS = CLAUDE_DIR / "projects"
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+__version__ = "1.2.0"
+HEALTH_MAGIC = "turn-diffs"     # identifies our server on a shared port
+MAX_REPORT_AGE_DAYS = 30        # reports older than this are pruned
+MAX_REPORTS_KEPT = 40           # ...and only this many are kept regardless
+MAX_LOG_BYTES = 2 * 1024 * 1024
 MAX_DIFF_LINES = 800
 MAX_PROMPT_CHARS = 4000
 MAX_AGENT_CHARS = 16000
 MAX_THINK_CHARS = 8000   # per thinking block shown in the Process section
 SPLIT_CONTEXT = 3   # unchanged lines kept around each change in the side-by-side view
+MAX_SPLIT_ROWS = 1500       # ceiling on rows emitted per side-by-side table, collapsed included
+SPLIT_HIDDEN_RUN_MAX = 120  # a longer collapsed run is summarised instead of emitted
 _LINENO = re.compile(r"^\s*\d+[\t\u2192]")   # "   12<TAB>" / "   12->" prefix from Read output
 
-# Where per-session reports and on/off flags live. Override with $TURN_DIFFS_DIR
-# (the plugin build points this at ${CLAUDE_PLUGIN_DATA}); defaults under ~/.claude.
+# Where per-session reports and on/off flags live. Defaults under ~/.claude so a
+# manual install works with no setup; hooks/hooks.json sets $TURN_DIFFS_DIR to
+# ${CLAUDE_PLUGIN_DATA} for plugin installs, which keeps the two from sharing a
+# state directory (and lets Claude Code reclaim the space on uninstall).
 DATA_DIR = Path(os.environ.get("TURN_DIFFS_DIR", str(CLAUDE_DIR / "turn-diffs")))
 
 
@@ -165,9 +177,14 @@ def load(path):
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # A line that parses to a non-dict (null / number / string) would
+                # make every downstream .get() raise, and the hook swallows that
+                # exception — the report would silently stop updating.
+                if isinstance(obj, dict):
+                    entries.append(obj)
     except OSError:
         pass
     return entries
@@ -254,10 +271,24 @@ def parse_notification(txt):
             "order": [], "files": {}}
 
 
+# Text the harness echoes back into the transcript as a "user" entry. These are
+# not prompts: treating them as turns splits a real turn in two and misattributes
+# every file edit that follows them to the wrong prompt.
+_ECHO_PREFIXES = ("<local-command-stdout>", "<local-command-caveat>",
+                  "<command-message>", "[Request interrupted")
+
+
+def _is_harness_echo(txt):
+    return txt.lstrip().startswith(_ECHO_PREFIXES)
+
+
 def is_user_prompt(e):
     if e.get("type") != "user" or e.get("isMeta"):
         return False
     if notification_text(e):
+        return False
+    raw = e.get("message", {}).get("content")
+    if _is_harness_echo(raw if isinstance(raw, str) else _text_of(raw)):
         return False
     content = e.get("message", {}).get("content")
     if isinstance(content, str):
@@ -267,6 +298,19 @@ def is_user_prompt(e):
         has_tx = any(isinstance(b, dict) and b.get("type") == "text" for b in content)
         return has_tx and not has_tr
     return False
+
+
+def _local_ts(raw):
+    """Transcript timestamps are ISO-8601 UTC ('...Z'); show them in local time."""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return str(raw)[:19].replace("T", " ")
 
 
 def clean_prompt(text):
@@ -398,10 +442,53 @@ def _new_rec(file_state, path):
             "after": file_state.get(path)}
 
 
+_SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>\s*", re.S)
+
+
+def _read_is_partial(inp):
+    """A Read with offset/limit returns a slice, not the file. Seeding file_state
+    from it would present that slice as the complete 'before' content."""
+    return bool(inp.get("offset") or inp.get("limit"))
+
+
+def _clean_read_result(txt):
+    """Read results carry line-number gutters and sometimes an appended
+    <system-reminder> block; neither is part of the file."""
+    return strip_linenos(_SYSREM_RE.sub("", txt))
+
+
+def errored_tool_ids(entries):
+    """tool_use ids whose result came back as an error.
+
+    Replaying a denied or failed Edit/Write as if it succeeded poisons
+    file_state for every later turn, so the edit must be skipped."""
+    bad = set()
+    for e in entries:
+        if e.get("type") != "user":
+            continue
+        content = e.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and b.get("is_error") and b.get("tool_use_id")):
+                bad.add(b["tool_use_id"])
+    return bad
+
+
 # ---------------------------------------------------------------- core: build turns
-def build_turns(entries):
+def build_turns(entries, subs=None):
+    """Group the transcript into turns and reconstruct each file's before/after.
+
+    subs: optional {agent_tool_use_id: info} from scan_subagents(). When given,
+    a subagent's resulting file contents are folded into file_state at the point
+    its Agent call was issued — without that, the NEXT turn diffs against
+    pre-subagent content and attributes the subagent's edits to itself.
+    Defaults to None so the plain build_turns(entries) contract is unchanged.
+    """
     file_state = {}        # path -> best-known current full content (or None)
-    pending_reads = {}     # Read tool_use_id -> path
+    pending_reads = {}     # Read tool_use_id -> (path, is_partial)
+    errored = errored_tool_ids(entries)
     turns = []
     cur = None
 
@@ -420,9 +507,9 @@ def build_turns(entries):
     for e in entries:
         for tid, txt in tool_results(e):
             if tid in pending_reads:
-                p = pending_reads.pop(tid)
-                if p not in file_state and txt:
-                    file_state[p] = strip_linenos(txt)
+                p, partial = pending_reads.pop(tid)
+                if p not in file_state and txt and not partial and tid not in errored:
+                    file_state[p] = _clean_read_result(txt)
 
         # a prompt the user queued while Claude was working is stored only as a
         # queued_command attachment (never a normal user message) — make it a turn
@@ -478,14 +565,22 @@ def build_turns(entries):
                 tid = tu.get("id")
                 if tid:
                     cur["agent_tuids"].append(tid)
+                    # The subagent edited real files; carry its results forward so
+                    # the next turn diffs against what is actually on disk.
+                    if subs:
+                        for p, r in (subs.get(tid, {}).get("files") or {}).items():
+                            if isinstance(r, dict) and r.get("after") is not None:
+                                file_state[p] = r["after"]
                 continue
             if name == "Read":
                 fp = inp.get("file_path")
                 if fp:
-                    pending_reads[tu.get("id")] = fp
+                    pending_reads[tu.get("id")] = (fp, _read_is_partial(inp))
                 continue
             if name not in EDIT_TOOLS or cur is None:
                 continue
+            if tu.get("id") in errored:
+                continue          # the tool call failed or was denied — never happened
             path = inp.get("file_path") or inp.get("notebook_path")
             if not path:
                 continue
@@ -500,23 +595,26 @@ def collect_edits(entries):
     (order, files) shaped like a single turn's file map."""
     file_state = {}
     pending_reads = {}
+    errored = errored_tool_ids(entries)
     files = {}
     order = []
     for e in entries:
         for tid, txt in tool_results(e):
             if tid in pending_reads:
-                p = pending_reads.pop(tid)
-                if p not in file_state and txt:
-                    file_state[p] = strip_linenos(txt)
+                p, partial = pending_reads.pop(tid)
+                if p not in file_state and txt and not partial and tid not in errored:
+                    file_state[p] = _clean_read_result(txt)
         for tu in assistant_tool_uses(e):
             name = tu.get("name")
             inp = tu.get("input", {}) or {}
             if name == "Read":
                 fp = inp.get("file_path")
                 if fp:
-                    pending_reads[tu.get("id")] = fp
+                    pending_reads[tu.get("id")] = (fp, _read_is_partial(inp))
                 continue
             if name not in EDIT_TOOLS:
+                continue
+            if tu.get("id") in errored:
                 continue
             path = inp.get("file_path") or inp.get("notebook_path")
             if not path:
@@ -549,44 +647,71 @@ def scan_subagents(session_path):
         if not tuid:
             continue
         jf = d / (meta.name[:-len(".meta.json")] + ".jsonl")
-        order, files = ([], {})
+        order, files, children = ([], {}, [])
         if jf.exists():
             try:
-                order, files = collect_edits(load(jf))
+                sub_entries = load(jf)
+                order, files = collect_edits(sub_entries)
+                # Agent calls this subagent made itself. Their tool_use ids live
+                # here, not in the main transcript, which is why nested agents
+                # were previously dropped on the floor.
+                children = [tu.get("id") for e in sub_entries
+                            for tu in assistant_tool_uses(e)
+                            if tu.get("name") in ("Agent", "Task") and tu.get("id")]
             except Exception:
-                order, files = ([], {})
+                order, files, children = ([], {}, [])
         out[tuid] = {"agentType": info.get("agentType", ""),
                      "description": info.get("description", ""),
                      "spawnDepth": info.get("spawnDepth"),
-                     "order": order, "files": files}
+                     "order": order, "files": files, "children": children}
     return out
 
 
-def attach_agents(turns, session_path, entries):
+def attach_agents(turns, session_path, entries, subs=None):
     """Build each turn's agent panels from the agents it spawned. Placement comes
     from the main transcript (which turn issued the Agent call), file diffs from the
     subagent transcript, and result text from the notification (delivered in any
     form). This catches agents whose notification was queued/attached, not just
     plain-text ones."""
-    subs = scan_subagents(session_path)
+    subs = subs if subs is not None else scan_subagents(session_path)
     notifs = collect_notifications(entries)
+    MAX_DEPTH = 4          # backstop; real nesting is 1-2 levels
+
+    def build_entry(tuid, depth):
+        info = subs.get(tuid, {})
+        notif = notifs.get(tuid, {})
+        atype = info.get("agentType", "")
+        name = info.get("description", "")
+        if not name:  # fall back to the quoted name in the notification summary
+            m = re.search(r'"([^"]+)"', notif.get("label", ""))
+            name = m.group(1) if m else (notif.get("label", "") or "")
+        entry = {
+            "label": name, "agentType": atype, "status": notif.get("status", ""),
+            "result": notif.get("result", ""), "order": info.get("order", []),
+            "files": info.get("files", {}), "tuid": tuid, "depth": depth,
+        }
+        # Always keep the panel: the main transcript proves the agent was
+        # spawned, so an interrupted or crashed one must leave a trace rather
+        # than vanishing as if it never ran.
+        if not (entry["result"] or entry["order"] or atype):
+            entry["label"] = entry["label"] or "Agent"
+            entry["result"] = "(no result recorded — the agent was interrupted or crashed)"
+        if depth:
+            entry["label"] = ("↳ " * depth) + (entry["label"] or "nested agent")
+        return entry
+
+    def walk(tuid, depth, seen, out):
+        if tuid in seen or depth > MAX_DEPTH:
+            return
+        seen.add(tuid)
+        out.append(build_entry(tuid, depth))
+        for child in subs.get(tuid, {}).get("children", []):
+            walk(child, depth + 1, seen, out)
+
     for t in turns:
+        seen = set()
         for tuid in t.get("agent_tuids", []):
-            info = subs.get(tuid, {})
-            notif = notifs.get(tuid, {})
-            atype = info.get("agentType", "")
-            desc = info.get("description", "")
-            name = desc
-            if not name:  # fall back to the quoted name in the notification summary
-                m = re.search(r'"([^"]+)"', notif.get("label", ""))
-                name = m.group(1) if m else (notif.get("label", "") or "")
-            entry = {
-                "label": name, "agentType": atype, "status": notif.get("status", ""),
-                "result": notif.get("result", ""), "order": info.get("order", []),
-                "files": info.get("files", {}), "tuid": tuid,
-            }
-            if entry["result"] or entry["order"] or atype:
-                t["agents"].append(entry)
+            walk(tuid, 0, seen, t["agents"])
 
 
 def file_diff_lines(rec):
@@ -619,7 +744,7 @@ def render_md(turns, session_path, title=""):
     out = [head, "", f"{sub}Session: `{session_path}`", "",
            f"{len(turns)} turn(s).", "", "---", ""]
     for i, t in enumerate(turns, 1):
-        ts = (t["ts"] or "")[:19].replace("T", " ")
+        ts = _local_ts(t["ts"])
         out.append(f"## Turn {i}" + (f"  ·  {ts}" if ts else ""))
         out.append("")
         out.append("**Prompt:**")
@@ -698,6 +823,8 @@ details.turn>summary{cursor:pointer;list-style:none;padding:12px 14px;background
 display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 details.turn>summary::-webkit-details-marker{display:none}
 .tn{font-weight:700}
+.chg{flex:0 0 auto;white-space:nowrap;font:600 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+color:var(--add-fg);background:var(--add-bg);border-radius:10px;padding:3px 8px}
 .ts{color:var(--muted);font-size:11.5px}
 .pin{color:var(--fg);opacity:.8;font-size:13px}
 .body{padding:6px 14px 14px}
@@ -810,6 +937,13 @@ text-decoration:none;color:var(--fg);border:1px solid transparent;margin:2px 0}
 .sb-r1{display:flex;align-items:center;gap:8px;min-width:0}
 .sb-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600}
 .sb-mt{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:17px}
+details.turn.pending>summary{opacity:.85}
+.pending-note{margin:10px 0 4px;padding:9px 12px;border:1px dashed var(--line);
+border-radius:8px;color:var(--muted);font-size:13px}
+.td-empty{margin:24px 0;padding:16px;border:1px dashed var(--line);border-radius:10px;
+color:var(--muted);text-align:center;display:flex;gap:10px;justify-content:center;align-items:center}
+.td-empty button{cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--fg);
+border-radius:6px;padding:4px 12px;font:inherit}
 .sb-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--muted)}
 .sb-dot.finished{background:#3fb950}
 .sb-dot.seen{background:var(--muted);opacity:.55}
@@ -827,11 +961,25 @@ border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit;resize:v
 .td-cbox button{cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--fg);
 border-radius:6px;padding:4px 12px;font-size:13px}
 .td-cbox button.pri{background:var(--accent);border-color:var(--accent);color:#0b0f14}
-.td-cmark{margin:4px 0;padding:6px 9px;border-left:3px solid var(--accent);background:var(--card);
-border-radius:0 6px 6px 0;font-size:13px;display:flex;gap:8px;align-items:flex-start}
-.td-cmark .ctext{white-space:pre-wrap;flex:1;min-width:0}
-.td-cmark .x{cursor:pointer;color:var(--muted);flex:0 0 auto}
+/* inline review comment shown under the commented line (unified: block inside <pre>;
+   split: a full-width row). Force a normal font/wrapping even inside <pre>. */
+.td-cmark{display:flex;gap:8px;align-items:flex-start;margin:3px 0 7px;padding:7px 10px;
+border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--card);
+border-radius:0 7px 7px 0;white-space:normal;
+font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+pre.diff .td-cmark{margin:3px 6px 7px}
+.td-cmark .cbody{flex:1;min-width:0}
+.td-cmark .cloc{display:block;font:600 11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+color:var(--accent);margin-bottom:2px}
+.td-cmark .ctext{white-space:pre-wrap;word-break:break-word}
+.td-cmark .x{cursor:pointer;color:var(--muted);flex:0 0 auto;font-size:12px;line-height:1.4}
 .td-cmark .x:hover{color:#f85149}
+tr.td-cmark-row>td,tr.td-ins-row>td{padding:0!important;border:0!important;background:transparent!important}
+tr.td-cmark-row .td-cmark{margin:3px 0 7px}
+pre.diff .td-cbox{white-space:normal;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:6px}
+/* highlight a line that has a comment */
+pre.diff span.ln.commented{box-shadow:inset 3px 0 0 var(--accent)}
+table.split tr.commented td.cell{box-shadow:inset 0 -1px 0 var(--accent)}
 .td-cbar{position:fixed;top:64px;right:16px;z-index:80;display:none;gap:10px;align-items:center;
 background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:8px 12px;
 box-shadow:0 6px 20px rgba(0,0,0,.35)}
@@ -955,19 +1103,49 @@ var SID = "__SID__";
   function mkey(k,n){ return 'td:'+SID+':'+k+':'+n; }
   function mark(k,n){ try{ return LS.getItem(mkey(k,n))==='1'; }catch(e){ return false; } }
   function setMark(k,n,v){ try{ if(v){LS.setItem(mkey(k,n),'1');}else{LS.removeItem(mkey(k,n));} }catch(e){} }
+  // runtime-only "already wired" markers, preserved across morphdom updates
+  var TDGUARDS=['wt','wd','we','wf','fcb','hl'];
+  // session-scoped keys must be namespaced too, or two sessions share open/scroll state
+  function skey(k){ return 'td:'+SID+':'+k; }
   var filter=null; try{ filter=JSON.parse(LS.getItem('td:'+SID+':filter')); }catch(e){}
-  if(!filter) filter={regular:true,starred:true,hidden:false};
+  // Merge over defaults rather than replacing: a filter saved by an older build
+  // has no `changes` key, and passing undefined to classList.toggle() *toggles*
+  // instead of forcing, making the chip flip state on every re-render.
+  filter=Object.assign({regular:true,starred:true,hidden:false,changes:false},
+                       (filter&&typeof filter==='object')?filter:{});
+  filter.changes=!!filter.changes;
   function saveFilter(){ try{ LS.setItem('td:'+SID+':filter',JSON.stringify(filter)); }catch(e){} }
   function numOf(d){ return (d.id||'').replace('turn-',''); }
   function applyMarks(){
     q('details.turn').forEach(function(d){
       var n=numOf(d), st=mark('star',n), hi=mark('hide',n), cat=hi?'hidden':(st?'starred':'regular');
+      var hasChg=(d.dataset.changes && d.dataset.changes!=='0');
       d.classList.toggle('starred',st); d.classList.toggle('hiddenmark',hi);
-      d.style.display=filter[cat]?'':'none';
+      // a just-sent placeholder has no file changes yet — never filter it out
+      var show=filter[cat] && (!filter.changes || hasChg || d.classList.contains('pending'));
+      d.style.display=show?'':'none';
       var sb=d.querySelector('.tbtn.star'); if(sb) sb.textContent=st?'★':'☆';
       var hb=d.querySelector('.tbtn.hidebtn'); if(hb){ hb.textContent=hi?'⊙':'⊘'; hb.title=hi?'Show this turn':'Hide this turn'; }
     });
-    q('.fchip').forEach(function(ch){ ch.classList.toggle('active',!!filter[ch.getAttribute('data-cat')]); });
+    q('.fchip').forEach(function(ch){
+      var on = ch.getAttribute('data-chg') ? !!filter.changes : !!filter[ch.getAttribute('data-cat')];
+      ch.classList.toggle('active',on); });
+    // A filter combination can hide every turn, leaving a blank page that looks
+    // broken and persists across reloads — always offer a way back.
+    var anyVisible=false;
+    q('details.turn').forEach(function(d){ if(d.style.display!=='none') anyVisible=true; });
+    var er=document.getElementById('td-empty');
+    if(!anyVisible && q('details.turn').length){
+      if(!er){
+        er=document.createElement('div'); er.id='td-empty'; er.className='td-empty';
+        er.innerHTML="No turns match the current filters. <button type='button'>Reset filters</button>";
+        er.querySelector('button').addEventListener('click',function(){
+          filter={regular:true,starred:true,hidden:false,changes:false};
+          saveFilter(); applyMarks(); });
+        var w=document.querySelector('.wrap'); if(w) w.appendChild(er);
+      }
+      er.style.display='';
+    } else if(er){ er.style.display='none'; }
   }
 
   function wireTurns(){
@@ -982,7 +1160,7 @@ var SID = "__SID__";
   function wireDetails(){
     q('details[id]').forEach(function(d){
       if(d.dataset.wd) return; d.dataset.wd='1';
-      var k='open:'+d.id, v; try{v=sessionStorage.getItem(k);}catch(e){}
+      var k=skey('open:'+d.id), v; try{v=sessionStorage.getItem(k);}catch(e){}
       if(v==='0') d.open=false; if(v==='1') d.open=true;
       d.addEventListener('toggle',function(){ try{sessionStorage.setItem(k,d.open?'1':'0');}catch(e){} });
     });
@@ -990,7 +1168,7 @@ var SID = "__SID__";
   function wireFilter(){
     q('.fchip').forEach(function(ch){
       if(ch.dataset.wf) return; ch.dataset.wf='1';
-      ch.addEventListener('click',function(){ var c=ch.getAttribute('data-cat'); filter[c]=!filter[c]; saveFilter(); applyMarks(); });
+      ch.addEventListener('click',function(){ var c=ch.getAttribute('data-chg')?'changes':ch.getAttribute('data-cat'); filter[c]=!filter[c]; saveFilter(); applyMarks(); });
     });
   }
   function highlight(){
@@ -1011,8 +1189,8 @@ var SID = "__SID__";
       var gid=ex.getAttribute('data-grp'), key='exp:'+gid, cell=ex.querySelector('.exp-cell'), rows=map[gid]||[];
       function setOpen(open){ rows.forEach(function(r){ r.style.display=open?'table-row':'none'; });
         ex.classList.toggle('open',open); if(cell) cell.textContent=(open?'▴ hide ':'⋯ show ')+rows.length+' unchanged line'+(rows.length!==1?'s':''); }
-      var saved; try{ saved=sessionStorage.getItem(key); }catch(e){} setOpen(saved==='1');
-      ex.addEventListener('click',function(){ var open=!ex.classList.contains('open'); try{ sessionStorage.setItem(key,open?'1':'0'); }catch(e){} setOpen(open); });
+      var saved; try{ saved=sessionStorage.getItem(skey(key)); }catch(e){} setOpen(saved==='1');
+      ex.addEventListener('click',function(){ var open=!ex.classList.contains('open'); try{ sessionStorage.setItem(skey(key),open?'1':'0'); }catch(e){} setOpen(open); });
     });
   }
   function setupContent(){ wireDetails(); wireTurns(); wireFilter(); wireExpanders(); highlight(); applyMarks();
@@ -1022,15 +1200,15 @@ var SID = "__SID__";
     var btn=document.getElementById('vt');
     function apply(v){ document.body.classList.toggle('view-split',v==='split');
       if(btn) btn.textContent=(v==='split')?'≡ Unified':'◧ Side-by-side'; }
-    var v='unified'; try{ v=sessionStorage.getItem('view')||'unified'; }catch(e){}
+    var v='unified'; try{ v=sessionStorage.getItem(skey('view'))||'unified'; }catch(e){}
     apply(v);
     if(btn) btn.addEventListener('click',function(){ var nv=document.body.classList.contains('view-split')?'unified':'split';
-      try{ sessionStorage.setItem('view',nv); }catch(e){} apply(nv); });
+      try{ sessionStorage.setItem(skey('view'),nv); }catch(e){} apply(nv); });
   })();
 
   if(/^#turn-\\d+$/.test(location.hash)){ var tt=document.getElementById(location.hash.slice(1)); if(tt) tt.open=true; }
-  try{ var yy=sessionStorage.getItem('scrollY'); if(yy) window.scrollTo(0,parseInt(yy,10));
-    window.addEventListener('beforeunload',function(){ try{sessionStorage.setItem('scrollY',window.scrollY);}catch(e){} }); }catch(e){}
+  try{ var yy=sessionStorage.getItem(skey('scrollY')); if(yy) window.scrollTo(0,parseInt(yy,10));
+    window.addEventListener('beforeunload',function(){ try{sessionStorage.setItem(skey('scrollY'),window.scrollY);}catch(e){} }); }catch(e){}
   setupContent();
 
   (function(){
@@ -1048,13 +1226,32 @@ var SID = "__SID__";
     function fit(){ document.body.style.paddingBottom=(box.offsetHeight+20)+'px'; }
     setTimeout(fit,60); window.addEventListener('resize',fit);
     fetch('/target/'+SID).then(function(r){return r.json();}).then(function(j){
-      if(j&&j.ok){ tgt.innerHTML='⚡ target: <b>'+j.backend+' '+j.target+'</b>'+(j.status?(' · '+j.status):''); }
+      if(j&&j.ok){ var name=j.label?(j.backend+' · '+j.label):(j.backend+' '+j.target);
+        tgt.innerHTML='⚡ target: <b></b><span class="tstat"></span>';
+        tgt.querySelector('b').textContent=name;
+        if(j.status) tgt.querySelector('.tstat').textContent=' · '+j.status;
+        tgt.title=(j.title?(j.title+'  '):'')+'['+j.backend+' '+j.target+']'; }
       else{ tgt.textContent='⚠ '+((j&&j.error)||'no pane found'); } fit(); }).catch(function(){});
-    function send(){ var text=mde.value(); if(!text.trim()) return; btn.disabled=true; status.textContent='sending…';
+    var sending=false;
+    function send(){ var text=mde.value(); if(!text.trim()||sending) return;
+      sending=true; btn.disabled=true; status.textContent='sending…';
       fetch('/prompt/'+SID,{method:'POST',headers:{'Content-Type':'application/json','X-TD-Token':tok},body:JSON.stringify({text:text})})
-        .then(function(r){return r.json();}).then(function(j){ if(j.ok){ status.textContent=''; mde.value(''); fit(); } else { status.textContent='✗ '+(j.error||'failed'); } })
-        .catch(function(e){ status.textContent='✗ '+e; }).then(function(){ btn.disabled=false; }); }
+        .then(function(r){return r.json();}).then(function(j){ if(j.ok){ status.textContent=''; mde.value(''); fit();
+            if(window.__tdComposer && window.__tdComposer.onAfterSend) window.__tdComposer.onAfterSend(text); }
+          else { status.textContent='✗ '+(j.error||'failed'); } })
+        .catch(function(e){ status.textContent='✗ '+e; })
+        .then(function(){ sending=false; btn.disabled=false; }); }
     btn.addEventListener('click',send);
+    // bridge so the diff-comments feature can live-preview + send through this composer
+    window.__tdComposer={present:true, onAfterSend:null,
+      value:function(){ return mde.value(); },
+      set:function(t){ mde.value(t); setTimeout(fit,20); },
+      focus:function(){ try{ mde.codemirror.focus(); }catch(e){} },
+      // used by type-to-compose: put the keystroke that triggered the focus
+      // into the editor, so the first character typed isn't lost
+      insert:function(ch){ try{ mde.codemirror.focus(); mde.codemirror.replaceSelection(ch);
+                                lastKey=Date.now(); setTimeout(fit,20); }catch(e){} },
+      send:function(){ send(); }};
     // ---- slash-command autocomplete (list from /commands/<sid>) ----
     var CM=mde.codemirror.constructor;
     var cac=document.createElement('div'); cac.className='td-cac'; cac.style.display='none';
@@ -1112,10 +1309,10 @@ var SID = "__SID__";
     // Formatting toggle (persisted) — show/hide the toolbar on demand
     var fmtBtn=document.getElementById('td-fmt');
     function setFmt(on){ box.classList.toggle('show-fmt',on); if(fmtBtn) fmtBtn.classList.toggle('active',on); setTimeout(fit,150); }
-    var fmtOn=false; try{ fmtOn=sessionStorage.getItem('td-fmt')==='1'; }catch(e){}
+    var fmtOn=false; try{ fmtOn=sessionStorage.getItem(skey('td-fmt'))==='1'; }catch(e){}
     setFmt(fmtOn);
     if(fmtBtn) fmtBtn.addEventListener('click',function(){ var on=!box.classList.contains('show-fmt');
-      try{ sessionStorage.setItem('td-fmt',on?'1':'0'); }catch(e){} setFmt(on); });
+      try{ sessionStorage.setItem(skey('td-fmt'),on?'1':'0'); }catch(e){} setFmt(on); });
     // auto-grow (debounced) + note typing time so live morphs can defer while you type
     var fitT;
     mde.codemirror.on('change', function(){ lastKey=Date.now(); clearTimeout(fitT); fitT=setTimeout(fit,120); });
@@ -1143,6 +1340,13 @@ var SID = "__SID__";
             if(from.classList.contains('hiddenmark')) to.classList.add('hiddenmark');
           }
           if(from.nodeName==='DETAILS' && from.id){ to.open=from.open; }
+          // Carry over the runtime-only "already wired" markers. morphdom removes
+          // any attribute missing from the incoming markup, and the server never
+          // emits these — losing them makes setupContent() bind a SECOND listener
+          // to the same button, so ★/⊘ toggle twice and cancel out.
+          if(from.dataset && to.dataset){
+            TDGUARDS.forEach(function(k){ if(from.dataset[k]) to.dataset[k]=from.dataset[k]; });
+          }
           if(from.dataset && from.dataset.hl && from.textContent===to.textContent){ return false; }
           return true;
         }});
@@ -1151,20 +1355,26 @@ var SID = "__SID__";
     }).catch(function(){}).then(function(){ morphing=false; });
   }
   var deferT;
+  var pendingUpdate=false;
   if(httpLive && window.EventSource){
     try{ new EventSource('/events/'+location.pathname.split('/').pop()).onmessage=function(){
-      if(document.hidden) return;
+      // A hidden tab must remember it missed an update, not discard it: once the
+      // session goes idle no further events arrive, so the page would stay stale
+      // until a manual reload.
+      if(document.hidden){ pendingUpdate=true; return; }
       if(Date.now()-lastKey<1500){ clearTimeout(deferT); deferT=setTimeout(morphUpdate,1500); }  // defer while typing
       else morphUpdate();
     }; }catch(e){}
+    document.addEventListener('visibilitychange',function(){
+      if(!document.hidden && pendingUpdate){ pendingUpdate=false; morphUpdate(); } });
   }
 
   (function(){
     var btn=document.getElementById('ar');
-    function isOn(){ try{return sessionStorage.getItem('autoreload')==='on';}catch(e){return false;} }
+    function isOn(){ try{return sessionStorage.getItem(skey('autoreload'))==='on';}catch(e){return false;} }
     function label(){ if(btn){ btn.textContent=isOn()?('⟳ Auto-reload: on ('+REFRESH+'s)'):'⏸ Auto-reload: off'; } }
     label();
-    if(btn) btn.addEventListener('click',function(){ try{ sessionStorage.setItem('autoreload', isOn()?'off':'on'); }catch(e){} label(); });
+    if(btn) btn.addEventListener('click',function(){ try{ sessionStorage.setItem(skey('autoreload'), isOn()?'off':'on'); }catch(e){} label(); });
     if(REFRESH>0 && !httpLive){
       function tick(){ if(isOn() && !document.hidden){ location.reload(); } else { setTimeout(tick,1000); } }
       setTimeout(tick, REFRESH*1000);
@@ -1206,8 +1416,12 @@ var SID = "__SID__";
           var a=document.createElement('a');
           a.className='sb-item'+(s.sid===SID?' current':'');
           a.href='/'+s.file;
-          a.innerHTML='<span class="sb-r1"><span class="sb-dot '+st+'"></span><span class="sb-nm"></span></span>'
+          // status comes from a JSON endpoint that ultimately reads strings out
+          // of `herdr pane list`, so it is whitelisted rather than interpolated
+          a.innerHTML='<span class="sb-r1"><span class="sb-dot"></span><span class="sb-nm"></span></span>'
             +'<span class="sb-mt"></span>';
+          if(['working','blocked','finished','seen'].indexOf(st)>=0)
+            a.querySelector('.sb-dot').classList.add(st);
           a.querySelector('.sb-nm').textContent=s.name||s.sid;
           var base=s.cwd?s.cwd.replace(/\\/+$/,'').replace(/^.*\\//,''):'';
           a.querySelector('.sb-mt').textContent=[base,(s.turns?(s.turns+' turn(s)'):'')].filter(Boolean).join(' · ');
@@ -1221,73 +1435,182 @@ var SID = "__SID__";
       .then(function(rows){ rows.forEach(function(s){ if(s.sid===SID) markSeen(s.sid,s.mtime); }); }).catch(function(){}); }
   })();
 
-  // ---- diff comments -> compile a prompt and send to the agent ----
+  // ---- diff comments: line/file-level review comments -> live-composed prompt ----
   (function(){
-    var CKEY='td:'+SID+':comments', tok=window.__TD_TOKEN__;
+    var CKEY='td:'+SID+':comments';
     var comments=[]; try{ comments=JSON.parse(LS.getItem(CKEY))||[]; }catch(e){}
+    var C=window.__tdComposer||null, lastAuto='';
+    var drafts={};   // in-progress comment editors, keyed by fid|side|line
+    var isTouch=false; try{ isTouch=(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches)||('ontouchstart' in window); }catch(e){}
     function save(){ try{ LS.setItem(CKEY,JSON.stringify(comments)); }catch(e){} }
 
     var bar=document.createElement('div'); bar.className='td-cbar';
-    bar.innerHTML='<b class="n"></b><button class="pri send" type="button">Send to agent</button>'
+    bar.innerHTML='<b class="n"></b><button class="pri send" type="button">Send</button>'
       +'<button class="clr" type="button">Clear</button>';
     document.body.appendChild(bar);
     var barN=bar.querySelector('.n'), sendB=bar.querySelector('.send'), clrB=bar.querySelector('.clr');
+
+    function shortSnip(s){ s=(s||'').replace(/^[+\\- ]/,'').trim(); return s.length>100?s.slice(0,100)+'…':s; }
+    function base(p){ return (p||'').replace(/^.*\\//,''); }
+
+    // ---- compile the review comments into a prompt ----
+    function compile(){
+      if(!comments.length) return '';
+      var out=['I reviewed the changes and left the following review comments:',''];
+      comments.forEach(function(c,i){
+        var loc = c.line ? ('`'+c.file+':'+c.line+'`') : ('`'+c.file+'` (file-level)');
+        out.push((i+1)+'. '+loc+' — '+c.text);
+        if(c.snip) out.push('   > '+c.snip);
+      });
+      out.push(''); out.push('Please address these comments.');
+      return out.join('\\n');
+    }
+    function syncComposer(){   // mirror the compiled prompt into the composer (don't clobber custom edits)
+      if(!C) return;
+      var compiled=compile(), cur=C.value();
+      if(cur===lastAuto || cur.trim()===''){ C.set(compiled); lastAuto=compiled; }
+    }
     function updateBar(){ bar.classList.toggle('show',comments.length>0);
       barN.textContent=comments.length+' comment'+(comments.length!==1?'s':''); }
-    clrB.addEventListener('click',function(){ comments=[]; save(); renderMarks(); updateBar(); });
+    function changed(){ save(); renderMarks(); updateBar(); syncComposer(); }
+    clrB.addEventListener('click',function(){ comments=[]; changed(); });
 
+    // ---- capture what/where the user is commenting on ----
     function fileOf(el){ var f=el.closest?el.closest('.file'):null; if(!f) return '';
       var h=f.querySelector('summary h3'); return h?h.textContent:''; }
+    // The SAME path can appear in several turns. Remember which block the comment
+    // was written in (each .file carries a per-turn id) so it re-anchors there
+    // instead of jumping to the earliest turn that happened to touch the file.
+    function fidOf(el){ var f=el.closest?el.closest('.file'):null; return f&&f.id?f.id:''; }
     function lineInfo(el){
-      if(el.classList.contains('ln')){ return {line:'',snip:(el.textContent||'').replace(/^[+\\- ]/,'')}; }
-      var tr=el.closest('tr'), lno='';
-      if(tr){ var a=tr.querySelector('.lno'), b=tr.querySelector('.rno');
-        lno=(b&&b.textContent)||(a&&a.textContent)||''; }
-      return {line:lno?('L'+lno):'', snip:el.textContent||''};
+      if(el.classList.contains('ln')){   // unified
+        return {side:el.getAttribute('data-side')||'', line:parseInt(el.getAttribute('data-ln'),10)||0,
+                snip:(el.textContent||'')};
+      }
+      var tr=el.closest('tr'), del=el.classList.contains('del'), side=del?'old':'new';  // split cell
+      var nc=tr?tr.querySelector(del?'.lno':'.rno'):null;
+      return {side:side, line:nc?(parseInt(nc.textContent,10)||0):0, snip:(el.textContent||'')};
     }
-    function shortSnip(s){ s=(s||'').trim(); return s.length>90?s.slice(0,90)+'…':s; }
+
+    function placeAfter(anchor, el){   // insert a node right after a diff line, in either view
+      if(anchor.tagName==='TD'){
+        var tr=anchor.closest('tr'), w=document.createElement('tr'); w.className='td-ins-row';
+        var td=document.createElement('td'); td.colSpan=4; td.appendChild(el); w.appendChild(td);
+        tr.parentNode.insertBefore(w, tr.nextSibling); return w;
+      }
+      anchor.parentNode.insertBefore(el, anchor.nextSibling); return el;
+    }
 
     function openEditor(anchor, ctx){
-      var host=anchor;
-      if(anchor.tagName==='SPAN') host=anchor.closest('pre')||anchor;
-      else if(anchor.tagName==='TD') host=anchor.closest('table')||anchor;
-      var nx=host.nextSibling;
-      if(nx && nx.classList && nx.classList.contains('td-cbox')){ nx.querySelector('textarea').focus(); return; }
+      var nxt = anchor.tagName==='TD' ? (anchor.closest('tr')||{}).nextElementSibling : anchor.nextElementSibling;
+      if(nxt){ var ex = (nxt.classList&&nxt.classList.contains('td-cbox')) ? nxt : (nxt.querySelector?nxt.querySelector('.td-cbox'):null);
+        if(ex){ ex.querySelector('textarea').focus(); return; } }
       var box=document.createElement('div'); box.className='td-cbox';
-      box.innerHTML='<div class="ctx"></div><textarea placeholder="Comment on this code… (Ctrl+Enter to add)"></textarea>'
+      var ph=isTouch?'Leave a review comment…  (Enter = newline · tap Add)'
+                    :'Leave a review comment…  (Enter to add · Shift+Enter for newline)';
+      box.innerHTML='<div class="ctx"></div>'
+        +'<textarea placeholder="'+ph+'"></textarea>'
         +'<div class="row"><button class="cancel" type="button">Cancel</button>'
         +'<button class="pri add" type="button">Add comment</button></div>';
-      box.querySelector('.ctx').textContent=ctx.file+(ctx.line?(' · '+ctx.line):'')+(ctx.snip?(' · '+shortSnip(ctx.snip)):'');
-      host.parentNode.insertBefore(box, host.nextSibling);
+      box.querySelector('.ctx').textContent=(ctx.line?(base(ctx.file)+':'+ctx.line):(base(ctx.file)+' · file-level'))
+        +(ctx.snip?('   ·   '+shortSnip(ctx.snip)):'');
+      var wrap=placeAfter(anchor, box);
       var ta=box.querySelector('textarea'); ta.focus();
-      box.querySelector('.cancel').addEventListener('click',function(){ box.remove(); });
+      // Remember the draft: a live morph can replace this subtree at any moment,
+      // and losing a half-written comment is worse than any staleness.
+      var dkey=[ctx.fid||'',ctx.side||'',ctx.line||0].join('|');
+      if(drafts[dkey]){ ta.value=drafts[dkey]; }
+      ta.addEventListener('input',function(){ drafts[dkey]=ta.value; lastKey=Date.now(); });
+      function close(){ delete drafts[dkey]; wrap.remove(); }
+      box.querySelector('.cancel').addEventListener('click',close);
       box.querySelector('.add').addEventListener('click',function(){
         var v=ta.value.trim(); if(!v){ ta.focus(); return; }
-        comments.push({file:ctx.file,line:ctx.line,snip:shortSnip(ctx.snip),text:v});
-        save(); box.remove(); renderMarks(); updateBar(); });
-      ta.addEventListener('keydown',function(e){ if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){ box.querySelector('.add').click(); } });
+        comments.push({file:ctx.file,fid:ctx.fid||'',side:ctx.side||'',line:ctx.line||0,
+                       snip:shortSnip(ctx.snip),snipFull:(ctx.snip||'').replace(/^[+\\- ]/,''),
+                       text:v});
+        close(); changed(); });
+      // Desktop: Enter adds, Shift+Enter = newline. Touch: Enter = newline, tap Add. Ctrl/Cmd+Enter always adds.
+      ta.addEventListener('keydown',function(e){
+        if(e.key!=='Enter') return;
+        if(e.ctrlKey||e.metaKey){ e.preventDefault(); box.querySelector('.add').click(); return; }
+        if(!isTouch && !e.shiftKey){ e.preventDefault(); box.querySelector('.add').click(); }
+      });
+      return box;
     }
 
+    // Re-open editors for drafts the morph destroyed, so typing survives updates.
+    function restoreDrafts(){
+      Object.keys(drafts).forEach(function(k){
+        if(!drafts[k]) return;
+        var parts=k.split('|'), fid=parts[0], side=parts[1], line=parseInt(parts[2],10)||0;
+        var f=fid?document.getElementById(fid):null; if(!f) return;
+        if(f.querySelector('.td-cbox')) return;                // already open
+        var anchor=line
+          ? f.querySelector('pre.diff span.ln[data-ln="'+line+'"][data-side="'+(side||'new')+'"]')
+          : f.querySelector('summary');
+        if(anchor) openEditor(anchor,{file:fileOf(anchor)||'',fid:fid,side:side,line:line,snip:''});
+      });
+    }
+
+    // ---- render the inline comment markers (both views) ----
+    function mkMark(c, idx){
+      var mk=document.createElement('div'); mk.className='td-cmark'; mk.title=c.text;
+      mk.innerHTML='<span class="cbody"><span class="cloc"></span><span class="ctext"></span></span>'
+        +'<span class="x" title="remove comment">✕</span>';
+      mk.querySelector('.cloc').textContent=c.line?(base(c.file)+':'+c.line):'file-level';
+      mk.querySelector('.ctext').textContent=c.text;
+      mk.querySelector('.x').addEventListener('click',function(){ comments.splice(idx,1); changed(); });
+      return mk;
+    }
+    function findFile(c){
+      // Prefer the exact block the comment was written in; fall back to the path
+      // for comments stored before fid was recorded.
+      if(c.fid){ var byId=document.getElementById(c.fid); if(byId) return byId; }
+      var out=null;
+      q('.file').forEach(function(f){ if(out) return; var h=f.querySelector('summary h3');
+        if(h&&h.textContent===c.file) out=f; }); return out; }
+    // The stored snippet is truncated with an ellipsis for display; matching must
+    // use the untruncated text, or any line over 100 chars can never re-anchor.
+    function matchText(c){ return (c.snipFull||c.snip||'').replace(/…$/,''); }
+    // insert after the previous mark on the same anchor, so several comments on
+    // one line keep the order they were written in
+    function insertAfter(anchor, node, lastMap, key){
+      var ref=lastMap[key]||anchor;
+      ref.parentNode.insertBefore(node, ref.nextSibling);
+      lastMap[key]=node;
+    }
     function renderMarks(){
+      q('tr.td-cmark-row').forEach(function(m){ m.remove(); });
       q('.td-cmark').forEach(function(m){ m.remove(); });
+      q('.commented').forEach(function(el){ el.classList.remove('commented'); });
+      var lastU={}, lastS={};
       comments.forEach(function(c,idx){
-        var target=null;
-        q('.file').forEach(function(f){ if(target) return;
-          var h=f.querySelector('summary h3'); if(!h||h.textContent!==c.file) return;
-          if(c.snip){ f.querySelectorAll('pre.diff span.ln, table.split td.cell').forEach(function(el){
-            if(target) return; if((el.textContent||'').indexOf(c.snip)>=0) target=el; }); }
-          if(!target) target=f.querySelector('summary');
-        });
-        var host=null;
-        if(target){ host=target.tagName==='SPAN'?target.closest('pre'):
-                         target.tagName==='TD'?target.closest('table'):target; }
-        if(!host||!host.parentNode) return;
-        var mk=document.createElement('div'); mk.className='td-cmark';
-        mk.innerHTML='<span class="ctext"></span><span class="x" title="remove">✕</span>';
-        mk.querySelector('.ctext').textContent=(c.line?(c.line+'  '):'')+c.text;
-        mk.querySelector('.x').addEventListener('click',(function(ix){ return function(){
-          comments.splice(ix,1); save(); renderMarks(); updateBar(); }; })(idx));
-        host.parentNode.insertBefore(mk, host.nextSibling);
+        var f=findFile(c); if(!f) return;
+        if(!c.line){ var s=f.querySelector('summary');
+          if(s) insertAfter(s, mkMark(c,idx), lastU, 'sum:'+(c.fid||c.file)); return; }
+        var txt=matchText(c);
+        // unified
+        var span=f.querySelector('pre.diff span.ln[data-ln="'+c.line+'"][data-side="'+(c.side||'new')+'"]');
+        if(!span && txt){ f.querySelectorAll('pre.diff span.ln').forEach(function(el){
+          if(!span && (el.textContent||'').indexOf(txt)>=0) span=el; }); }
+        if(span){ span.classList.add('commented');
+          insertAfter(span, mkMark(c,idx), lastU, 'u:'+(c.fid||c.file)+':'+c.side+':'+c.line); }
+        // split
+        var row=null, numSel=(c.side==='old')?'.lno':'.rno';
+        f.querySelectorAll('table.split tr').forEach(function(tr){ if(row) return;
+          var nc=tr.querySelector(numSel); if(nc&&(parseInt(nc.textContent,10)||0)===c.line) row=tr; });
+        if(!row && txt){ f.querySelectorAll('table.split tr').forEach(function(tr){ if(row) return;
+          if((tr.textContent||'').indexOf(txt)>=0) row=tr; }); }
+        if(row){ row.classList.add('commented');
+          // a comment on a collapsed context line would otherwise render inside a
+          // hidden region — open that run so the card is actually visible
+          if(row.classList.contains('hid')){
+            var g=row.getAttribute('data-grp');
+            if(g) q('tr.exp[data-grp="'+g+'"]').forEach(function(ex){ if(!ex.classList.contains('open')) ex.click(); });
+          }
+          var w=document.createElement('tr'); w.className='td-cmark-row';
+          var td=document.createElement('td'); td.colSpan=4; td.appendChild(mkMark(c,idx)); w.appendChild(td);
+          insertAfter(row, w, lastS, 's:'+(c.fid||c.file)+':'+c.side+':'+c.line); }
       });
     }
 
@@ -1298,7 +1621,7 @@ var SID = "__SID__";
       var sel=window.getSelection&&window.getSelection(); if(sel&&!sel.isCollapsed) return;
       var file=fileOf(ln); if(!file) return;
       var info=lineInfo(ln);
-      openEditor(ln, {file:file, line:info.line, snip:info.snip});
+      openEditor(ln, {file:file, fid:fidOf(ln), side:info.side, line:info.line, snip:info.snip});
     });
 
     function addFileButtons(){
@@ -1307,50 +1630,129 @@ var SID = "__SID__";
         var b=document.createElement('button'); b.className='fcmt'; b.type='button'; b.textContent='💬 comment';
         b.addEventListener('click',function(ev){ ev.preventDefault(); ev.stopPropagation();
           var f=s.closest('.file'); if(f&&!f.open) f.open=true;
-          var h=s.querySelector('h3'); openEditor(s, {file:h?h.textContent:'', line:'', snip:''}); });
+          var h=s.querySelector('h3');
+          openEditor(s, {file:h?h.textContent:'', fid:(f&&f.id)||'', side:'', line:0, snip:''}); });
         s.appendChild(b);
       });
     }
 
-    function compile(){
-      var order=[], byFile={};
-      comments.forEach(function(c){ if(!byFile[c.file]){ byFile[c.file]=[]; order.push(c.file); } byFile[c.file].push(c); });
-      var out=['I reviewed the changes in turn-diffs and have the following comments:',''];
-      order.forEach(function(f){
-        out.push('### '+f);
-        byFile[f].forEach(function(c){ out.push('- '+(c.line?(c.line+' '):'')+c.text+(c.snip?('   (`'+c.snip+'`)'):'')); });
-        out.push('');
-      });
-      out.push('Please address these comments.');
-      return out.join('\\n');
-    }
-
     sendB.addEventListener('click',function(){
       if(!comments.length) return;
-      var text=compile();
-      if(httpLive && tok){
-        sendB.disabled=true; barN.textContent='sending…';
-        fetch('/prompt/'+SID,{method:'POST',headers:{'Content-Type':'application/json','X-TD-Token':tok},
-          body:JSON.stringify({text:text})}).then(function(r){return r.json();}).then(function(j){
-            if(j.ok){ comments=[]; save(); renderMarks(); updateBar(); }
-            else barN.textContent='✗ '+(j.error||'failed');
-          }).catch(function(e){ barN.textContent='✗ '+e; }).then(function(){ sendB.disabled=false; });
-      } else {
+      if(C){
+        var cur=C.value(), block=compile();
+        if(cur.trim()==='' || cur===lastAuto){ C.set(block); lastAuto=block; }
+        else {
+          // The composer holds text the user typed. Appending keeps BOTH — the
+          // previous behaviour silently sent their text and left the comments
+          // stuck in the bar, looking like Send had failed.
+          var merged=cur.replace(/\\s+$/,'')+'\\n\\n'+block;
+          C.set(merged); lastAuto=merged;
+        }
+        C.focus(); C.send(); }
+      else {   // file:// — no terminal target; copy the compiled prompt
+        var text=compile();
         try{ navigator.clipboard.writeText(text).then(function(){ barN.textContent='copied to clipboard'; },
           function(){ barN.textContent='copy failed'; }); }
-        catch(e){ barN.textContent='no live server'; }
+        catch(e){ barN.textContent='clipboard unavailable'; }
       }
     });
+    // once the composer sends the comment prompt, consume the comments
+    if(C){ C.onAfterSend=function(sent){
+      if(comments.length && sent===lastAuto){ comments=[]; lastAuto=''; changed(); } }; }
 
-    window.__td_afterContent=function(){ addFileButtons(); renderMarks(); };
-    addFileButtons(); renderMarks(); updateBar();
+    window.__td_afterContent=function(){ addFileButtons(); renderMarks(); restoreDrafts(); };
+    addFileButtons(); renderMarks(); updateBar(); syncComposer();
+  })();
+
+  // ---- optimistic turn: show the prompt immediately on send -------------
+  // The Stop/PostToolUse hooks can take many seconds to produce the first
+  // rendering of a new turn, during which the page looked like nothing had
+  // happened. Insert a placeholder straight away; the next morph replaces it
+  // with the server-rendered turn (same id, so morphdom reconciles in place).
+  (function(){
+    var C=window.__tdComposer;
+    if(!C||!C.present) return;
+    function addPending(text){
+      var wrap=document.querySelector('.wrap'); if(!wrap) return;
+      var n=q('details.turn').length+1;
+      var d=document.createElement('details');
+      d.className='turn pending'; d.id='turn-'+n; d.open=true;
+      d.setAttribute('data-sig','pending'); d.setAttribute('data-changes','0');
+      var s=document.createElement('summary');
+      s.innerHTML="<span class='tn'></span><span class='ts'></span><span class='pin'></span>"
+        +"<span class='working'><span class='dot'></span>working</span>";
+      s.querySelector('.tn').textContent='#'+n;
+      s.querySelector('.ts').textContent='just now';
+      s.querySelector('.pin').textContent=text.replace(/\\s+/g,' ').slice(0,110);
+      d.appendChild(s);
+      var b=document.createElement('div'); b.className='body';
+      var bq=document.createElement('blockquote'); bq.className='prompt'; bq.textContent=text;
+      var note=document.createElement('div'); note.className='pending-note';
+      note.textContent='Prompt sent — waiting for the first update from the session…';
+      b.appendChild(bq); b.appendChild(note); d.appendChild(b);
+      wrap.appendChild(d);
+      try{ applyMarks(); }catch(e){}
+      d.scrollIntoView({behavior:'smooth',block:'start'});
+    }
+    var prev=C.onAfterSend;
+    C.onAfterSend=function(sent){ try{ if(prev) prev(sent); }catch(e){} addPending(sent); };
+  })();
+
+  // ---- keyboard navigation ---------------------------------------------
+  (function(){
+    function inEditor(el){
+      if(!el) return false;
+      if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable) return true;
+      return !!(el.closest && el.closest('.CodeMirror'));
+    }
+    function visible(){
+      return q('details.turn').filter(function(d){ return d.style.display!=='none'; });
+    }
+    function currentIdx(ts){
+      var y=window.scrollY+90, best=0;
+      ts.forEach(function(d,i){
+        if(d.getBoundingClientRect().top+window.scrollY<=y) best=i; });
+      return best;
+    }
+    function go(delta){
+      var ts=visible(); if(!ts.length) return;
+      var i=currentIdx(ts)+delta;
+      if(i<0) i=0; if(i>ts.length-1) i=ts.length-1;
+      var d=ts[i];
+      if(!d.open) d.open=true;
+      d.scrollIntoView({behavior:'smooth',block:'start'});
+    }
+    document.addEventListener('keydown',function(e){
+      if(e.ctrlKey && !e.altKey && !e.metaKey &&
+         (e.key==='ArrowUp'||e.key==='ArrowDown')){
+        e.preventDefault(); go(e.key==='ArrowUp'?-1:1); return;
+      }
+      // Type-to-compose: a bare printable key with nothing focused starts a
+      // prompt instead of being swallowed by the document.
+      if(e.ctrlKey||e.metaKey||e.altKey) return;
+      if(inEditor(document.activeElement)) return;
+      if(e.key==null||e.key.length!==1) return;
+      var C=window.__tdComposer;
+      if(C&&C.present&&C.insert){ e.preventDefault(); C.insert(e.key); }
+    });
   })();
 })();
 """
 
 
 def esc(s):
-    return html.escape(s, quote=False)
+    """Escape for HTML. Quotes included: much of this file interpolates esc()
+    output into single-quoted attributes (id=, data-*, <meta content=>), so
+    leaving quotes raw allowed a file path or session title to break out of the
+    attribute and inject an event handler."""
+    return html.escape(s)
+
+
+# Only these schemes may appear in a rendered link. Agent answers can quote a
+# malicious README / web page / MCP result verbatim, and the report is served
+# from the same origin as the prompt-injection endpoint, so a javascript: or
+# data: href is a straight path to driving the user's terminal.
+_SAFE_URL_RE = re.compile(r"^(?:https?://|mailto:|/|\#|\./|\.\./)", re.I)
 
 
 # ---------------------------------------------------------------- mini markdown
@@ -1360,8 +1762,17 @@ def _md_inline(s):
     s = esc(s)
     codes = []
     s = re.sub(r"`([^`]+)`", lambda m: codes.append(m.group(1)) or f"\x00C{len(codes)-1}\x00", s)
-    s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
-               lambda m: f'<a href="{esc(m.group(2))}" target="_blank" rel="noopener">{m.group(1)}</a>', s)
+
+    def _link(m):
+        label, url = m.group(1), m.group(2)
+        # url is already HTML-escaped by the esc() above, so unescape before
+        # testing the scheme (&#x27; etc. must not hide a javascript: prefix).
+        raw = html.unescape(url)
+        if not _SAFE_URL_RE.match(raw.strip()):
+            return f"{label} ({url})"      # render inert, keep the text visible
+        return f'<a href="{url}" target="_blank" rel="noopener">{label}</a>'
+
+    s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _link, s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", s)
     s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", s)
@@ -1450,24 +1861,59 @@ def render_markdown(text):
         return "<p>" + esc(text or "") + "</p>"
 
 
-def diff_html(lines, keep=False):
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def diff_html(lines, keep=False, anchors=True):
     """Unified diff view. keep=True marks it to stay visible even in split mode
-    (used for the hunks fallback, which has no clean before/after to split)."""
+    (used for the hunks fallback, which has no clean before/after to split).
+
+    anchors=True emits data-ln/data-side so review comments can bind to a real
+    file line. Pass anchors=False for the hunks fallback: there the lines are a
+    concatenation of independent per-edit diffs whose numbering restarts at 1
+    each time, so the values would be duplicated *and* wrong — a comment would
+    land on the wrong edit and the prompt would cite a bogus file:line."""
     if len(lines) > MAX_DIFF_LINES:
         lines = lines[:MAX_DIFF_LINES] + [f"... (diff truncated at {MAX_DIFF_LINES} lines)"]
     out = []
-    for ln in lines:
-        if ln.startswith("+++") or ln.startswith("---"):
+    old_no = new_no = None   # 1-based counters, tracked from @@ hunk headers
+    in_hunk = False
+    for idx, ln in enumerate(lines):
+        attrs = ""
+        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+        # A ---/+++ pair starts a new file header block (the hunks fallback
+        # concatenates several unified_diff outputs, so this can happen mid-list).
+        if ln.startswith("--- ") and nxt.startswith("+++ "):
+            in_hunk = False
+        # Only treat ---/+++ as a header OUTSIDE a hunk. Inside one they are
+        # ordinary content: deleting a markdown "---" rule yields the diff line
+        # "----", and mistaking it for a header desyncs every later line number.
+        if not in_hunk and (ln.startswith("+++") or ln.startswith("---")):
             cls = "meta"
         elif ln.startswith("@@"):
             cls = "hunk"
+            m = _HUNK_RE.match(ln)
+            if m:
+                old_no, new_no = int(m.group(1)), int(m.group(2))
+                in_hunk = True
         elif ln.startswith("+"):
             cls = "add"
+            if new_no is not None and anchors:
+                attrs = f' data-ln="{new_no}" data-side="new"'
+                new_no += 1
         elif ln.startswith("-"):
             cls = "del"
+            if old_no is not None and anchors:
+                attrs = f' data-ln="{old_no}" data-side="old"'
+                old_no += 1
         else:
             cls = "ctx"
-        out.append(f'<span class="ln {cls}">{esc(ln) if ln else "&nbsp;"}</span>')
+            if new_no is not None and anchors:
+                attrs = f' data-ln="{new_no}" data-side="new"'
+                new_no += 1
+            if old_no is not None:
+                old_no += 1
+        out.append(f'<span class="ln {cls}"{attrs}>{esc(ln) if ln else "&nbsp;"}</span>')
     pre_cls = "diff keep" if keep else "diff"
     return f'<pre class="{pre_cls}">' + "".join(out) + "</pre>"
 
@@ -1517,11 +1963,13 @@ def _split_tr(row, hidden=False, gid=""):
 
 
 def split_html(rec, key=""):
+    # NOTE: the cap is applied to *visible* rows further down, after the
+    # hide/context pass. Truncating the raw row list here instead would drop any
+    # change past row MAX_DIFF_LINES entirely — in a long file the side-by-side
+    # view would show nothing but collapsed context.
     rows = split_rows(rec.get("before"), rec.get("after"))
-    truncated = len(rows) > MAX_DIFF_LINES
-    if truncated:
-        rows = rows[:MAX_DIFF_LINES]
     n = len(rows)
+    truncated = False
     changed = [r[0] != "equal" for r in rows]
     # distance of each row to the nearest change, so SPLIT_CONTEXT lines stay visible
     dist = [10 ** 9] * n
@@ -1542,6 +1990,8 @@ def split_html(rec, key=""):
     out = ['<table class="split"><colgroup><col class="cn"><col class="cc">'
            '<col class="cn"><col class="cc"></colgroup><tbody>']
     i = grp = 0
+    shown = 0        # visible (non-collapsed) rows emitted so far
+    emitted = 0      # every <tr> emitted, collapsed ones included
     while i < n:
         if hide[i]:
             j = i
@@ -1551,17 +2001,30 @@ def split_html(rec, key=""):
             gid = f"{key}-g{grp}"
             grp += 1
             plural = "s" if count != 1 else ""
+            # Keep the total DOM bounded on very large files: past the ceiling,
+            # collapsed runs are summarised instead of being emitted row by row.
+            expandable = (count <= SPLIT_HIDDEN_RUN_MAX
+                          and emitted + count <= MAX_SPLIT_ROWS)
+            label = (f"⋯ show {count} unchanged line{plural}" if expandable
+                     else f"⋯ {count} unchanged line{plural} (not loaded)")
             out.append(f"<tr class='exp' data-grp='{esc(gid)}'><td class='lno'></td>"
-                       f"<td class='cell exp-cell' colspan='3'>⋯ show {count} unchanged line{plural}</td></tr>")
-            for k in range(i, j):
-                out.append(_split_tr(rows[k], hidden=True, gid=gid))
+                       f"<td class='cell exp-cell' colspan='3'>{label}</td></tr>")
+            if expandable:
+                for k in range(i, j):
+                    out.append(_split_tr(rows[k], hidden=True, gid=gid))
+                emitted += count
             i = j
         else:
+            if shown >= MAX_DIFF_LINES:
+                truncated = True
+                break
             out.append(_split_tr(rows[i]))
+            shown += 1
+            emitted += 1
             i += 1
     if truncated:
         out.append(f"<tr><td class='lno'></td><td class='cell meta' colspan='3'>"
-                   f"… truncated at {MAX_DIFF_LINES} rows</td></tr>")
+                   f"… truncated at {MAX_DIFF_LINES} changed/context rows</td></tr>")
     out.append("</tbody></table>")
     return "".join(out)
 
@@ -1603,7 +2066,7 @@ def file_block_html(path, rec, key=""):
     if mode == "hunks":
         P.append("<p class='note'>Prior full content of this file isn't in the "
                  "transcript; showing each edit's own change.</p>")
-        P.append(diff_html(lines))
+        P.append(diff_html(lines, anchors=False))
         P.append(split_html_ops(rec))
     else:
         P.append(diff_html(lines))
@@ -1640,8 +2103,12 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
             P.append(f"<style>@media(prefers-color-scheme:dark){{{dark}}}</style>")
     # apply the saved view synchronously, before first paint, so split view doesn't
     # flash narrow→wide on every auto-reload
-    early = ("<script>try{if((sessionStorage.getItem('view')||'unified')==='split')"
-             "document.body.classList.add('view-split');}catch(e){}</script>")
+    # NOTE: this key must match skey('view') in the main script — session-scoped,
+    # so two sessions open side by side don't share the view toggle.
+    _sid_js = json.dumps(session_id_of(session_path))
+    early = ("<script>try{var _k='td:'+%s+':view';"
+             "if((sessionStorage.getItem(_k)||'unified')==='split')"
+             "document.body.classList.add('view-split');}catch(e){}</script>" % _sid_js)
     # composer editor styles — load only over http (served by --serve); harmless 404 on file://
     P.append("<link rel='stylesheet' href='/assets/easymde.min.css'>")
     sidebar = ("<div id='sb-backdrop'></div>"
@@ -1654,7 +2121,8 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
     heading = esc(title) if title else "Turn-by-turn changes"
     chips = ("<button class='vt fchip' data-cat='regular' type='button'>Regular</button>"
              "<button class='vt fchip' data-cat='starred' type='button'>★ Starred</button>"
-             "<button class='vt fchip' data-cat='hidden' type='button'>Hidden</button>")
+             "<button class='vt fchip' data-cat='hidden' type='button'>Hidden</button>"
+             "<button class='vt fchip fchg' data-chg='1' type='button'>◆ Changes only</button>")
     controls = ("<button class='vt' id='vt' type='button'>◧ Side-by-side</button>"
                 f"{ar_btn}{chips}")
     P.append("<header><div class='htop'>"
@@ -1668,17 +2136,29 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
 
     # turns
     for i, t in enumerate(turns, 1):
-        ts = (t["ts"] or "")[:19].replace("T", " ")
+        ts = _local_ts(t["ts"])
         op = " open" if i == len(turns) else ""   # fresh start: only the last turn open
         work = ("<span class='working'><span class='dot'></span>working</span>"
                 if (in_progress and i == len(turns)) else "")
         # cheap content fingerprint so the live morph can skip unchanged turns entirely
-        sig = "%d.%d.%d.%d.%d.%d" % (len(t["prompt"]), len(t.get("answer", "")),
+        # Subagent panels are grafted on by attach_agents AFTER the process
+        # timeline is built, so agent state must be part of the fingerprint —
+        # otherwise a finished subagent's result and file diffs never reach an
+        # open page (morphdom skips the subtree as "unchanged").
+        agents = t.get("agents", [])
+        sig = "%d.%d.%d.%d.%d.%d.%d.%d.%d" % (
+              len(t["prompt"]), len(t.get("answer", "")),
               len(t.get("process", [])), len(t["order"]),
               sum(len(t["files"][p].get("ops", [])) for p in t["order"]),
-              1 if (in_progress and i == len(turns)) else 0)
-        P.append(f"<details class='turn' id='turn-{i}'{op} data-sig='{sig}'><summary>"
-                 f"<span class='tn'>#{i}</span>"
+              1 if (in_progress and i == len(turns)) else 0,
+              len(agents),
+              sum(len(a.get("result", "")) for a in agents),
+              sum(len(a.get("order", [])) for a in agents))
+        nchg = len(t["order"]) + sum(len(ag.get("order", [])) for ag in t.get("agents", []))
+        chg = (f"<span class='chg' title='{nchg} file(s) changed'>◆ {nchg}</span>" if nchg else "")
+        P.append(f"<details class='turn{' has-changes' if nchg else ''}' id='turn-{i}'{op} "
+                 f"data-sig='{sig}' data-changes='{nchg}'><summary>"
+                 f"<span class='tn'>#{i}</span>{chg}"
                  + (f"<span class='ts'>{esc(ts)}</span>" if ts else "")
                  + f"<span class='pin'>{esc(snippet(t['prompt'], 110))}</span>{work}"
                  "<button class='tbtn star' type='button' title='Star this turn'>☆</button>"
@@ -1768,17 +2248,30 @@ def render_html(turns, session_path, refresh=0, title="", in_progress=False, cwd
 # ---------------------------------------------------------------- generation glue
 def generate(session_path, out_path, fmt, refresh, in_progress=False):
     entries = load(session_path)
-    turns = build_turns(entries)
-    attach_agents(turns, session_path, entries)
+    subs = scan_subagents(session_path)
+    turns = build_turns(entries, subs=subs)
+    attach_agents(turns, session_path, entries, subs=subs)
     title = session_title(entries)
     cwd = entries_cwd(entries)
     if fmt == "md":
         content = render_md(turns, session_path, title)
     else:
         content = render_html(turns, session_path, refresh, title, in_progress, cwd)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, out_path)   # atomic: viewers never see a half-written report
+    # Unique temp name per writer: the Stop hook, the PostToolUse hook and the
+    # server's SSE regen all target the same report concurrently, and a shared
+    # "<sid>.html.tmp" let one truncate the file another was still writing —
+    # publishing a half-written report through the os.replace below.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(out_path.parent),
+                                    prefix=out_path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, out_path)   # atomic: viewers never see a half-written report
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return len(turns)
 
 
@@ -1844,10 +2337,39 @@ def _load_panes_map():
         return {}
 
 
-def _find_pane(sid):
+def _herdr_names(ws_id, tab_id):
+    """Resolve a herdr workspace_id/tab_id to their human labels (best effort)."""
+    import subprocess
+    ws = tab = ""
+    try:
+        if ws_id:
+            r = subprocess.run(["herdr", "workspace", "list"], capture_output=True, text=True, timeout=4)
+            if r.returncode == 0:
+                for w in json.loads(r.stdout).get("result", {}).get("workspaces", []):
+                    if w.get("workspace_id") == ws_id:
+                        ws = w.get("label") or ""
+                        break
+    except Exception:
+        pass
+    try:
+        if tab_id:
+            r = subprocess.run(["herdr", "tab", "list"], capture_output=True, text=True, timeout=4)
+            if r.returncode == 0:
+                for t in json.loads(r.stdout).get("result", {}).get("tabs", []):
+                    if t.get("tab_id") == tab_id:
+                        tab = t.get("label") or ""
+                        break
+    except Exception:
+        pass
+    return ws, tab
+
+
+def _find_pane(sid, names=False):
     """Locate the terminal pane hosting a session. Herdr is exact (its panes
     advertise their claude session id); tmux uses a cwd heuristic; zellij only via
-    a manual panes.json pin (its CLI can't target arbitrary panes)."""
+    a manual panes.json pin (its CLI can't target arbitrary panes). With names=True,
+    a herdr match also resolves the human workspace/tab labels (for display only —
+    injection always uses the internal pane_id)."""
     import subprocess
     m = _load_panes_map().get(sid)
     if isinstance(m, dict) and m.get("backend") and m.get("target"):
@@ -1857,7 +2379,19 @@ def _find_pane(sid):
         if r.returncode == 0:
             for p in json.loads(r.stdout).get("result", {}).get("panes", []):
                 if (p.get("agent_session") or {}).get("value") == sid:
-                    return "herdr", p["pane_id"], {"status": p.get("agent_status", "")}
+                    info = {"status": p.get("agent_status", "")}
+                    if names:
+                        ws, tab = _herdr_names(p.get("workspace_id"), p.get("tab_id"))
+                        title = p.get("terminal_title_stripped") or ""
+                        parts = [x for x in (ws, tab) if x]
+                        info["label"] = " › ".join(parts) if parts else p["pane_id"]
+                        if ws:
+                            info["ws"] = ws
+                        if tab:
+                            info["tab"] = tab
+                        if title:
+                            info["title"] = title
+                    return "herdr", p["pane_id"], info
     except Exception:
         pass
     try:
@@ -1884,21 +2418,32 @@ def _find_pane(sid):
 
 _PASTE_OPEN = "\x1b[200~"
 _PASTE_CLOSE = "\x1b[201~"
+# Everything in C0/C1 except \n and \t. \r matters most: it reaches the TUI as a
+# literal Enter, and ESC would let the text close its own bracketed paste and
+# then drive the interface as keystrokes (answering permission prompts, etc.).
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _sanitize_prompt(text):
+    """Make text safe to hand a terminal: no escape sequences, no bare carriage
+    returns, no way to terminate the bracketed paste early."""
+    body = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _CTRL_RE.sub("", body)
 
 
 def inject_prompt(sid, text):
-    """Type a prompt into the session's terminal pane and press Enter. Multiline
-    text is delivered as one bracketed-paste block so the TUI doesn't submit on
-    each newline (and control sequences in the text stay inert)."""
+    """Type a prompt into the session's terminal pane and press Enter. The text
+    is always delivered as one bracketed-paste block so the TUI doesn't submit on
+    each newline, and is stripped of control characters first so it cannot leave
+    paste mode and act as keystrokes."""
     import subprocess
     backend, target, info = _find_pane(sid)
     if not backend:
         return {"ok": False, **info}
-    body = (text or "").rstrip("\n")
+    body = _sanitize_prompt(text).rstrip("\n")
     if not body.strip():
         return {"ok": False, "error": "empty prompt"}
-    multiline = "\n" in body
-    wrapped = (_PASTE_OPEN + body + _PASTE_CLOSE) if multiline else body
+    wrapped = _PASTE_OPEN + body + _PASTE_CLOSE
     try:
         if backend == "herdr":
             subprocess.run(["herdr", "pane", "send-text", target, wrapped],
@@ -1928,9 +2473,11 @@ def inject_prompt(sid, text):
 
 
 def _serve_token():
-    """Stable per-machine token, embedded into served pages so only pages the
-    server itself handed out can POST /prompt. Localhost-only binding is the real
-    boundary; the token blocks naive/drive-by local requests."""
+    """Stable per-machine token gating POST /prompt (which types into the user's
+    terminal) and every request that did not arrive over loopback.
+
+    Loopback binding is only part of the trust boundary — see host_kind() — so
+    this token is what authenticates remote (proxied) clients."""
     f = DATA_DIR / "serve-token"
     try:
         t = f.read_text(encoding="utf-8").strip()
@@ -1942,8 +2489,16 @@ def _serve_token():
     t = secrets.token_urlsafe(24)
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        f.write_text(t, encoding="utf-8")
-        os.chmod(f, 0o600)
+        # Create with the restrictive mode already applied: write_text() + a
+        # later chmod leaves a window where the credential is world-readable.
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(t)
+    except FileExistsError:
+        try:
+            return f.read_text(encoding="utf-8").strip() or t
+        except OSError:
+            pass
     except OSError:
         pass
     return t
@@ -2249,10 +2804,64 @@ def _safe_regen(sid, tx, out, in_progress):
         pass
 
 
-def serve(port):
+# ---------------------------------------------------------------- server auth
+# The server binds loopback, but that is NOT the whole trust boundary:
+#   * a reverse proxy (tailscale serve) can forward remote traffic to it, and
+#   * any web page the user visits can DNS-rebind its own hostname to 127.0.0.1
+#     and become same-origin with us.
+# Both are distinguishable by the Host header the client sends, so every request
+# is classified before it is served.
+_LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+MAX_POST_BYTES = 64 * 1024      # a prompt; anything larger is abuse
+MAX_SSE_STREAMS = 32            # each live stream holds a thread for its lifetime
+_SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SSE_LOCK = threading.Lock()
+_SSE_COUNT = [0]
+
+
+def _allowed_remote_hosts():
+    """Extra hostnames allowed to reach the server through a proxy.
+
+    Defaults to Tailscale MagicDNS names so `tailscale serve` keeps working;
+    override/extend with TURN_DIFFS_ALLOWED_HOSTS='host1,*.example.ts.net'.
+    """
+    raw = os.environ.get("TURN_DIFFS_ALLOWED_HOSTS", "")
+    return [h.strip().lower() for h in raw.split(",") if h.strip()]
+
+
+def host_kind(host_header):
+    """'local' (loopback, trusted by the OS), 'remote' (proxied in, must
+    authenticate), or None (reject — almost certainly DNS rebinding)."""
+    h = (host_header or "").strip().lower()
+    name = (h.split("]")[0] + "]") if h.startswith("[") else h.split(":")[0]
+    if name in _LOOPBACK_HOSTS:
+        return "local"
+    for pat in _allowed_remote_hosts():
+        base = pat.split(":")[0]
+        if name == base or (base.startswith("*.") and name.endswith(base[1:])):
+            return "remote"
+    if name.endswith(".ts.net"):        # Tailscale MagicDNS
+        return "remote"
+    return None
+
+
+def safe_sid(sid):
+    """Session ids come straight off the URL and are used to build filesystem
+    paths, so they are allowlisted rather than sanitised."""
+    return bool(sid) and ".." not in sid and bool(_SID_RE.match(sid))
+
+
+def token_ok(supplied, token):
+    return bool(supplied) and hmac.compare_digest(str(supplied), str(token))
+
+
+def serve(port, ready=None):
     """Live mode: serve the reports dir on 127.0.0.1 with SSE push-on-change and a
     token-guarded POST /prompt/<sid> that types a prompt into the session's terminal
-    pane. The same HTML still works from file:// with no server. Ctrl-C to stop."""
+    pane. The same HTML still works from file:// with no server. Ctrl-C to stop.
+
+    ready(name, obj) — optional hook called with ('srv', server) once bound, so
+    callers (and tests) can shut the server down cleanly."""
     import http.server
     rd = reports_dir().resolve()
     rd.mkdir(parents=True, exist_ok=True)
@@ -2263,11 +2872,16 @@ def serve(port):
         def log_message(self, *_a):
             pass
 
-        def _send(self, code, ctype, body):
+        def _send(self, code, ctype, body, extra=()):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in extra:
+                self.send_header(k, v)
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -2278,19 +2892,74 @@ def serve(port):
             t = (rd / name).resolve()
             return t if (t.parent == rd and t.suffix == ".html" and t.exists()) else None
 
+        # ---- auth -------------------------------------------------------
+        def _query_token(self):
+            q = self.path.split("?", 1)
+            if len(q) < 2:
+                return ""
+            from urllib.parse import parse_qs
+            return (parse_qs(q[1]).get("t") or [""])[0]
+
+        def _cookie_token(self):
+            raw = self.headers.get("Cookie") or ""
+            for part in raw.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "td_token":
+                    return v
+            return ""
+
+        def _auth(self):
+            """Classify the request. Returns 'local'/'remote', or None after
+            having already sent the rejection."""
+            kind = host_kind(self.headers.get("Host"))
+            if kind is None:
+                # Unknown Host: a browser that rebound a hostile hostname to
+                # 127.0.0.1, not a real client of ours.
+                self._send(403, "text/plain; charset=utf-8", b"forbidden host")
+                return None
+            if kind == "local":
+                return kind
+            supplied = (self.headers.get("X-TD-Token")
+                        or self._query_token() or self._cookie_token())
+            if not token_ok(supplied, token):
+                self._send(401, "text/plain; charset=utf-8",
+                           b"authentication required: append ?t=<token> once "
+                           b"(see `turn-diffs --status`)")
+                return None
+            return kind
+
+        def _cookie_header(self):
+            """Trade a ?t=<token> URL for an HttpOnly cookie so the token stops
+            travelling in URLs (and out of reach of page scripts)."""
+            if self._query_token() and not self._cookie_token():
+                return [("Set-Cookie",
+                         f"td_token={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800")]
+            return []
+
         def do_GET(self):
             p = self.path.split("?")[0]
+            # Identity probe: answered before auth so a caller can tell "turn-diffs
+            # is on this port" from "some other app is on this port" without a
+            # token. Reveals nothing but the magic string and the version.
+            if p == "/healthz":
+                return self._send(200, "application/json; charset=utf-8",
+                                  json.dumps({"app": HEALTH_MAGIC, "version": __version__}).encode())
+            if self._auth() is None:
+                return
+            extra = self._cookie_header()
             if p == "/":
-                return self._send(200, "text/html; charset=utf-8", _index_html(rd))
+                return self._send(200, "text/html; charset=utf-8", _index_html(rd), extra)
             if p == "/sessions":
                 body = json.dumps(_sessions_json(rd)).encode()
-                return self._send(200, "application/json; charset=utf-8", body)
+                return self._send(200, "application/json; charset=utf-8", body, extra)
             if p.startswith("/commands/"):
                 sid = p[len("/commands/"):]
                 if sid.endswith(".html"):
                     sid = sid[:-5]
+                if not safe_sid(sid):
+                    return self._send(400, "application/json", b'{"error":"bad session id"}')
                 body = json.dumps(_slash_commands(_report_cwd(sid))).encode()
-                return self._send(200, "application/json; charset=utf-8", body)
+                return self._send(200, "application/json; charset=utf-8", body, extra)
             if p.startswith("/assets/"):
                 a = (assets / p[len("/assets/"):]).resolve()
                 if a.parent == assets and a.is_file():
@@ -2302,7 +2971,9 @@ def serve(port):
                 sid = p[len("/target/"):]
                 if sid.endswith(".html"):
                     sid = sid[:-5]
-                backend, target, info = _find_pane(sid)
+                if not safe_sid(sid):
+                    return self._send(400, "application/json", b'{"ok":false,"error":"bad session id"}')
+                backend, target, info = _find_pane(sid, names=True)
                 res = ({"ok": True, "backend": backend, "target": target, **info}
                        if backend else {"ok": False, **info})
                 return self._send(200, "application/json; charset=utf-8", json.dumps(res).encode())
@@ -2312,6 +2983,14 @@ def serve(port):
                 if not t:
                     return self._send(404, "text/plain", b"nope")
                 sid = name[:-5] if name.endswith(".html") else name
+                if not safe_sid(sid):
+                    return self._send(400, "text/plain", b"bad session id")
+                # Each stream parks a thread for its whole lifetime, so the
+                # number of them has to be bounded.
+                with _SSE_LOCK:
+                    if _SSE_COUNT[0] >= MAX_SSE_STREAMS:
+                        return self._send(503, "text/plain", b"too many live streams")
+                    _SSE_COUNT[0] += 1
                 tx = _transcript_for(sid)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -2349,38 +3028,75 @@ def serve(port):
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
+                finally:
+                    with _SSE_LOCK:
+                        _SSE_COUNT[0] -= 1
             t = self._report(p.lstrip("/"))
             if t:
                 body = t.read_bytes()
                 inj = ("<script>window.__TD_TOKEN__=%r;</script>" % token).encode()
                 body = body.replace(b"</head>", inj + b"</head>", 1)
-                return self._send(200, "text/html; charset=utf-8", body)
+                return self._send(200, "text/html; charset=utf-8", body, extra)
             return self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
+            if self._auth() is None:
+                return
             p = self.path.split("?")[0]
             if not p.startswith("/prompt/"):
                 return self._send(404, "text/plain", b"not found")
             sid = p[len("/prompt/"):]
             if sid.endswith(".html"):
                 sid = sid[:-5]
+            if not safe_sid(sid):
+                return self._send(400, "application/json", b'{"ok":false,"error":"bad session id"}')
             try:
                 n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._send(400, "application/json", b'{"ok":false,"error":"bad length"}')
+            # A prompt is small; an unbounded read lets any client balloon the process.
+            if n <= 0 or n > MAX_POST_BYTES:
+                return self._send(413, "application/json", b'{"ok":false,"error":"body too large"}')
+            try:
                 data = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
             except Exception:
                 return self._send(400, "application/json", b'{"ok":false,"error":"bad body"}')
-            if (self.headers.get("X-TD-Token") or data.get("token")) != token:
-                return self._send(403, "application/json", b'{"ok":false,"error":"bad token"}')
+            # POST types into the user's terminal, so it is token-gated on every
+            # host, loopback included — a local browser page is not trusted.
+            supplied = (self.headers.get("X-TD-Token") or data.get("token")
+                        or self._cookie_token())
+            if not token_ok(supplied, token):
+                return self._send(401, "application/json", b'{"ok":false,"error":"bad token"}')
             res = inject_prompt(sid, data.get("text", ""))
             body = json.dumps(res).encode()
             return self._send(200 if res.get("ok") else 409, "application/json; charset=utf-8", body)
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        # Two sessions can race to start the singleton; the loser should exit
+        # quietly rather than dumping a traceback into serve.log.
+        print(f"turn-diffs: cannot bind port {port}: {exc}", file=sys.stderr)
+        return 0 if _port_busy(port) else 1
+    try:
+        (DATA_DIR / "serve.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    if ready:
+        ready("srv", srv)
     print(f"turn-diffs live server: http://127.0.0.1:{port}/   (Ctrl-C to stop)", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.", file=sys.stderr)
+    finally:
+        srv.server_close()
+        try:
+            (DATA_DIR / "serve.pid").unlink(missing_ok=True)
+        except OSError:
+            pass
     return 0
 
 
@@ -2405,14 +3121,27 @@ def _wait_stable(path, settle=0.8, timeout=10.0):
         time.sleep(settle)
 
 
-def run_hook(fmt, refresh):
+def _hook_debug(msg):
+    """Hooks are silent by design (async, off the critical path), which makes a
+    misbehaving one undiagnosable. TURN_DIFFS_DEBUG=1 leaves a breadcrumb."""
+    if not os.environ.get("TURN_DIFFS_DEBUG"):
+        return
+    try:
+        with open(DATA_DIR / "hook.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except OSError:
+        pass
+
+
+def run_hook(fmt, refresh, out_override=None):
     """Driven by a Claude Code Stop hook. Reads the hook JSON from stdin. Runs only
     when THIS session was enabled via --enable; otherwise returns immediately. Writes
     to a per-session report file and never raises (it runs async, off the turn's
     critical path)."""
     try:
         data = json.load(sys.stdin)
-    except Exception:
+    except Exception as exc:
+        _hook_debug(f"bad stdin payload: {exc}")
         return 0
     sid = data.get("session_id")
     tp = data.get("transcript_path")
@@ -2422,8 +3151,9 @@ def run_hook(fmt, refresh):
     if not is_enabled(sid):
         return 0  # off for this session -> do nothing, cheaply
     if session is None or not session.exists():
+        _hook_debug(f"{sid}: transcript missing ({tp!r})")
         return 0
-    out = report_path_for(sid, fmt)
+    out = Path(out_override) if out_override else report_path_for(sid, fmt)
     event = data.get("hook_event_name", "Stop")
     if event == "Stop":
         _wait_stable(session)   # let the harness finish flushing the turn's final entries
@@ -2437,12 +3167,67 @@ def run_hook(fmt, refresh):
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
         generate(session, out, fmt, refresh, in_progress=(event != "Stop"))
-    except Exception:
-        pass
+        if event == "Stop":
+            prune_reports()
+    except Exception as exc:
+        _hook_debug(f"{sid}: generate failed: {type(exc).__name__}: {exc}")
     return 0
 
 
+def _rotate_log(path):
+    """Keep serve.log from growing without bound across restarts."""
+    try:
+        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
+
+
+def prune_reports():
+    """Drop stale reports. Every report inlines ~170 KB of vendored assets and a
+    long session can reach tens of MB, so without this the data dir grows forever
+    (nothing else in the tool ever deletes one)."""
+    rd = reports_dir()
+    if not rd.exists():
+        return 0
+    cutoff = time.time() - MAX_REPORT_AGE_DAYS * 86400
+    removed = 0
+    try:
+        files = sorted(rd.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return 0
+    for i, f in enumerate(files):
+        try:
+            sid = f.stem
+            if enabled_flag(sid).exists():
+                continue          # never prune a session that is still reporting
+            if i >= MAX_REPORTS_KEPT or f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    # also drop leftover temp files from interrupted writes
+    for t in rd.glob("*.tmp"):
+        try:
+            if t.stat().st_mtime < time.time() - 3600:
+                t.unlink()
+        except OSError:
+            pass
+    return removed
+
+
 def _resolve_session():
+    """Identify the session this command belongs to.
+
+    Claude Code exports CLAUDE_CODE_SESSION_ID into the tool environment; use it
+    when present. The newest-transcript heuristic below is only a fallback — with
+    two sessions open it can enable/disable the wrong one.
+    """
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if safe_sid(sid):
+        tx = _transcript_for(sid)
+        if tx:
+            return tx, sid
     s = current_session()
     if not s:
         print(f"No Claude sessions found under {PROJECTS}.", file=sys.stderr)
@@ -2458,6 +3243,20 @@ def _server_port():
 
 
 def _server_running(port):
+    """True only if *turn-diffs* is on this port.
+
+    A bare TCP connect isn't enough: 8787 is a common dev port, and mistaking
+    someone else's server for ours makes /turn-diffs print a link to their app
+    while live updates silently never start."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.5) as r:
+            return json.loads(r.read() or b"{}").get("app") == HEALTH_MAGIC
+    except Exception:
+        return False
+
+
+def _port_busy(port):
     import socket
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.3):
@@ -2472,13 +3271,22 @@ def ensure_server(port=None):
     port = port or _server_port()
     if _server_running(port):
         return port
+    if _port_busy(port):
+        print(f"turn-diffs: port {port} is in use by another application; "
+              f"set TURN_DIFFS_PORT to a free port.", file=sys.stderr)
+        return None
     import subprocess
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _rotate_log(DATA_DIR / "serve.log")
         with open(DATA_DIR / "serve.log", "ab") as lf:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "--serve", "--port", str(port)],
-                stdout=lf, stderr=lf, stdin=subprocess.DEVNULL, start_new_session=True)
+            # --dir must be propagated, or a custom DATA_DIR run serves reports
+            # from the default location and every printed link 404s.
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--serve", "--port", str(port)]
+            if str(DATA_DIR) != str(CLAUDE_DIR / "turn-diffs"):
+                cmd += ["--dir", str(DATA_DIR)]
+            subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
     except Exception:
         return None
     for _ in range(20):
@@ -2486,6 +3294,35 @@ def ensure_server(port=None):
             return port
         time.sleep(0.1)
     return None
+
+
+def cmd_stop(port):
+    """Shut down the detached live server. It is started with start_new_session=True
+    so it outlives the session that spawned it; without this there is no supported
+    way to stop it short of hunting the PID."""
+    if not _server_running(port):
+        print(f"turn-diffs: no live server on port {port}.")
+        return 0
+    pidfile = DATA_DIR / "serve.pid"
+    pid = None
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        pass
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                if not _server_running(port):
+                    pidfile.unlink(missing_ok=True)
+                    print(f"turn-diffs: stopped live server (pid {pid}).")
+                    return 0
+                time.sleep(0.1)
+        except (OSError, ProcessLookupError):
+            pass
+    print(f"turn-diffs: could not stop the server on port {port}; "
+          f"no usable pid file at {pidfile}.", file=sys.stderr)
+    return 1
 
 
 def cmd_enable(fmt, refresh):
@@ -2502,11 +3339,17 @@ def cmd_enable(fmt, refresh):
         print(f"Enabled, but the initial render failed: {exc}", file=sys.stderr)
         n = 0
     print(f"turn-diffs: ON for session {sid} ({n} turn(s) so far)")
-    port = ensure_server()
+    # The live server only serves .html (and only regenerates html), so a
+    # markdown report has no live view — printing one would 404.
+    port = ensure_server() if fmt == "html" else None
     if port:
         print(f"Live view: http://127.0.0.1:{port}/{out.name}")
+        for url in _remote_urls(out.name):
+            print(f"Remote:    {url}")
         print(f"Static fallback: {file_url(out)}")
     else:
+        if fmt != "html":
+            print("(markdown reports have no live view — use --format html for that)")
         print(f"Open: {file_url(out)}")
     return 0
 
@@ -2534,9 +3377,32 @@ def cmd_status(fmt):
         port = _server_port()
         if _server_running(port):
             print(f"Live view: http://127.0.0.1:{port}/{out.name}")
+            for url in _remote_urls(out.name):
+                print(f"Remote:    {url}")
         print(f"Static: {file_url(out)}")
     print(f"Reports dir: {reports_dir()}")
     return 0
+
+
+def _remote_urls(name):
+    """Tokenised URLs for reaching the report from another device.
+
+    Remote (proxied) requests must authenticate — see host_kind() — so the link
+    carries ?t=<token> once; the server then sets an HttpOnly cookie and later
+    visits need no token in the URL."""
+    out = []
+    try:
+        import subprocess
+        r = subprocess.run(["tailscale", "serve", "status"],
+                           capture_output=True, text=True, timeout=4)
+        if r.returncode != 0:
+            return out
+        token = _serve_token()
+        for m in re.finditer(r"^(https://\S+)", r.stdout, re.M):
+            out.append(f"{m.group(1).rstrip('/')}/{name}?t={token}")
+    except Exception:
+        pass
+    return out
 
 
 def cmd_ensure(fmt, refresh):
@@ -2599,7 +3465,11 @@ def main():
                     help="Enable for the current session if it's off, else just show status")
     ap.add_argument("--serve", action="store_true",
                     help="Serve reports on http://127.0.0.1 with live push-on-change (SSE)")
-    ap.add_argument("--port", type=int, default=8787, help="Port for --serve (default 8787)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="Port for --serve (default: $TURN_DIFFS_PORT or 8787)")
+    ap.add_argument("--stop", action="store_true", help="Stop the background live server")
+    ap.add_argument("--prune", action="store_true", help="Delete stale reports and exit")
+    ap.add_argument("--version", action="version", version=f"turn-diffs {__version__}")
     ap.add_argument("--dir", help="Base dir for reports/flags (default: $TURN_DIFFS_DIR or ~/.claude/turn-diffs)")
     ap.add_argument("--list", action="store_true", help="List recent sessions and exit")
     args = ap.parse_args()
@@ -2624,8 +3494,14 @@ def main():
         return cmd_status(args.format)
     if args.ensure:
         return cmd_ensure(args.format, refresh)
+    if args.stop:
+        return cmd_stop(args.port or _server_port())
+    if args.prune:
+        n = prune_reports()
+        print(f"turn-diffs: pruned {n} stale report(s) from {reports_dir()}")
+        return 0
     if args.serve:
-        return serve(args.port)
+        return serve(args.port or _server_port())
 
     if args.list:
         sessions = find_sessions()
@@ -2639,7 +3515,7 @@ def main():
         return 0
 
     if args.hook:
-        return run_hook(args.format, refresh)
+        return run_hook(args.format, refresh, args.output)
 
     out = Path(args.output) if args.output else None
 

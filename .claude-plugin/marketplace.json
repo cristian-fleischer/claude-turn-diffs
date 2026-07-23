@@ -8,11 +8,17 @@
   "plugins": [
     {
       "name": "turn-diffs",
-      "description": "Live, per-session turn-by-turn diff viewer for Claude Code — streams file changes, tool process, and answers into a browser, with a prompt composer.",
+      "description": "Live, per-session turn-by-turn diff viewer for Claude Code \u2014 streams file changes, tool process, and answers into a browser, with a prompt composer.",
       "source": ".",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "category": "productivity",
-      "tags": ["diff", "viewer", "live", "sessions", "review"]
+      "tags": [
+        "diff",
+        "viewer",
+        "live",
+        "sessions",
+        "review"
+      ]
     }
   ]
 }

@@ -2,6 +2,7 @@
 description: Per-session turn-by-turn diff reports (no arg = enable if off; on/off/status)
 argument-hint: "[on|off|status]"
 allowed-tools: Bash(python3:*)
+disable-model-invocation: true
 ---
 
 Control the turn-diffs reporter for THIS Claude Code session. The argument is
